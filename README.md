@@ -42,6 +42,8 @@ Built for NQ / MNQ index futures on fast execution charts (377-tick, 1-min, 3-mi
 
 ### Dashboard
 
+![EmaRejectionExecution dashboard on an NQ chart executing on MNQ](docs/images/dashboard.png)
+
 A panel on the chart shows:
 - the EMA value and slope
 - the rejection / bounce count on each side, with its structure
