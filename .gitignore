@@ -1,0 +1,11 @@
+# This repo lives inside NinjaTrader 8's bin\Custom folder, which also holds NinjaTrader's
+# stock scripts, compiled DLLs and third-party add-ons. Ignore everything, then list only
+# the files this repo tracks.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+
+!/Strategies/
+/Strategies/*
+!/Strategies/EmaRejectionExecution.cs
