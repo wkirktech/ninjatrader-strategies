@@ -81,6 +81,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool profitLocked;
         private string activeSignal = "";
 
+        // Globex VWAP (resets 18:00 ET), chop and trend
+        private TimeZoneInfo easternTz;
+        private DateTime vwapSession = DateTime.MinValue;
+        private double vwapPV, vwapVol, lastVwap;
+        private bool inChop, chopRisk;
+        private int chopEmaX, chopVwapX, trendDir;
+        private double chopEfficiency = 1;
+        private string pauseReason = "";
+
         private bool planValid;
         private int planDir;
         private double planEntry, planStop, planTarget;
@@ -101,7 +110,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // UI
         private ChartControl chartControlRef;
         private StackPanel uiPanel;
-        private TextBlock infoText;
+        private TextBlock infoText, statusText;
         private Button autoButton, dirButton, flatButton, buyButton, sellButton;
 
         protected override void OnStateChange()
@@ -172,6 +181,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ShowMarkers             = true;
                 ShowPlanLines           = true;
                 ShowDashboard           = true;
+
+                UseChopFilter           = true;
+                ChopLookbackBars        = 120;
+                ChopMinCrosses          = 4;
+                ChopMaxEfficiency       = 0.25;
+                TradeWithTrend          = true;
+
+                AddPlot(Brushes.Orange, "VWAP");
             }
             else if (State == State.Configure)
             {
@@ -194,6 +211,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 longSide  = new SideState { Dir = 1 };
                 shortSide = new SideState { Dir = -1 };
                 execTick  = Instruments[execIdx].MasterInstrument.TickSize;
+                easternTz = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
                 isChartHosted = ChartControl != null;
                 armed = isChartHosted ? StartArmed : true;   // Strategy Analyzer / no chart: always armed
@@ -257,6 +275,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradesThisSession = 0;
 
             UpdateSwings(c);
+            UpdateVwapAndChop(c);
             UpdateSide(shortSide, c);
             UpdateSide(longSide, c);
             UpdateTradeTarget(c);
@@ -264,6 +283,68 @@ namespace NinjaTrader.NinjaScript.Strategies
             DrawPlan();
             RefreshUi();
         }
+
+        #region VWAP / chop / trend
+        private void UpdateVwapAndChop(int c)
+        {
+            // Globex trading day rolls at 18:00 ET: shift ET time by 6h and take the date
+            DateTime et = TimeZoneInfo.ConvertTime(Time[c], NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo, easternTz);
+            DateTime session = et.AddHours(6).Date;
+            if (session != vwapSession)
+            {
+                vwapSession = session;
+                vwapPV  = 0;
+                vwapVol = 0;
+            }
+            double vol = Volume[c];
+            if (vol > 0)
+            {
+                vwapPV  += (High[c] + Low[c] + Close[c]) / 3.0 * vol;
+                vwapVol += vol;
+            }
+            if (vwapVol <= 0)
+                return;
+            lastVwap = vwapPV / vwapVol;
+            Values[0][c] = lastVwap;
+
+            double e = ema[c];
+            trendDir = Close[c] > e && Close[c] > lastVwap ? 1 : (Close[c] < e && Close[c] < lastVwap ? -1 : 0);
+
+            // Crosses: closes flipping sides of the EMA / VWAP (both counted together).
+            // Efficiency: net move / bar-by-bar distance travelled. Trend ~0.5+, chop goes nowhere (~0.2 or less).
+            chopEmaX  = 0;
+            chopVwapX = 0;
+            double path = 0;
+            int look = Math.Min(ChopLookbackBars, CurrentBar - c - 1);
+            for (int i = c; i < c + look; i++)
+            {
+                if ((Close[i] > ema[i]) != (Close[i + 1] > ema[i + 1]))
+                    chopEmaX++;
+                if (Values[0].IsValidDataPoint(i + 1) && (Close[i] > Values[0][i]) != (Close[i + 1] > Values[0][i + 1]))
+                    chopVwapX++;
+                path += Math.Abs(Close[i] - Close[i + 1]);
+            }
+            chopEfficiency = path > 0 ? Math.Abs(Close[c] - Close[c + look]) / path : 1;
+
+            // Crosses alone = early "risk" heads-up; crosses + low efficiency = CHOP (pauses entries)
+            bool crossesHit = chopEmaX + chopVwapX >= ChopMinCrosses;
+            bool wasChop = inChop, wasRisk = chopRisk;
+            inChop   = crossesHit && chopEfficiency <= ChopMaxEfficiency;
+            chopRisk = crossesHit && !inChop;
+            if (inChop != wasChop || chopRisk != wasRisk)
+                Log0(inChop ? "CHOP detected" + (UseChopFilter ? ", entries paused" : "") : chopRisk ? "Chop risk" : "Chop cleared");
+        }
+
+        private string StatusText()
+        {
+            if (lastVwap <= 0)
+                return "Trend --";
+            string trend = trendDir > 0 ? "BULLISH" : trendDir < 0 ? "BEARISH" : "MIXED";
+            string t = "Trend " + trend + "  VWAP " + Fmt(lastVwap) + "\n";
+            t += inChop ? "⚠ CHOP – NO ENTRIES" : chopRisk ? "Chop risk" : "Chop: none";
+            return t;
+        }
+        #endregion
 
         #region Setup detection
         private void UpdateSwings(int c)
@@ -543,7 +624,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             SideState s = PickSide(c);
             planValid = s != null && BuildPlan(s, c);
 
-            bool allowed = planValid && armed && CanTradeNow() && InSession(c)
+            // Chop / trend pause automatic setups only; BUY/SELL @EMA (forced) always go through
+            pauseReason = "";
+            if (s != null && !s.Forced)
+            {
+                if (UseChopFilter && inChop)
+                    pauseReason = "chop";
+                else if (TradeWithTrend && trendDir != s.Dir)
+                    pauseReason = "trend not " + (s.Dir < 0 ? "bearish" : "bullish");
+            }
+
+            bool allowed = planValid && pauseReason.Length == 0 && armed && CanTradeNow() && InSession(c)
                 && (MaxTradesPerSession <= 0 || tradesThisSession < MaxTradesPerSession);
             if (!allowed)
             {
@@ -787,7 +878,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 t += "  SL " + Fmt(planStop) + "  TP " + Fmt(planTarget)
                     + (planFallback ? " (min " + (StopLossPts * MinTargetR).ToString("0.##") +(double.IsNaN(planLeg) ? ", no leg)" : ", " + legName + Fmt(planLeg) + " too close)") : " (" + legName + Fmt(planLeg) + ")")
                     + "  " + (risk > 0 ? (reward / risk).ToString("0.00") : "-") + "R\n";
-                string waitWhy = planTooClose ? "waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
+                string waitWhy = pauseReason.Length > 0 ? "PAUSED (" + pauseReason + ")" : planTooClose ?"waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
                 t += "Order: " + (entryOrder != null ? entryOrder.OrderState + " @ " + Fmt(entryOrder.LimitPrice) + (planTooClose ? " (held, price close)" : "")
                     : (armed ? (CanTradeNow() ? waitWhy : "live only") : "AUTO is OFF")) + "\n";
             }
@@ -805,6 +896,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (chartControlRef == null || !ShowDashboard || ema == null || CurrentBars[0] < 1)
                 return;
             string text   = BuildDashboardText();
+            string status = StatusText();
+            Brush statusBrush = inChop ? Brushes.Red : chopRisk ? Brushes.Yellow : trendDir > 0 ? Brushes.LimeGreen : trendDir < 0 ? Brushes.Orange : Brushes.Gray;
             bool isArmed  = armed;
             string dir    = Direction == EmaRejDirection.Both ? "BOTH" : Direction == EmaRejDirection.LongOnly ? "LONG" : "SHORT";
             chartControlRef.Dispatcher.InvokeAsync(new Action(() =>
@@ -812,6 +905,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (infoText == null)
                     return;
                 infoText.Text = text;
+                statusText.Text       = status;
+                statusText.Foreground = statusBrush;
                 autoButton.Content    = isArmed ? "AUTO: ON" : "AUTO: OFF";
                 autoButton.Background = isArmed ? new SolidColorBrush(Color.FromRgb(20, 110, 40)) : new SolidColorBrush(Color.FromRgb(45, 45, 50));
                 autoButton.Foreground = isArmed ? Brushes.White : Brushes.Gainsboro;
@@ -869,6 +964,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Margin     = new Thickness(0, 4, 0, 6),
                 Text       = "loading..."
             };
+            statusText = new TextBlock
+            {
+                Foreground = Brushes.Gray,
+                FontFamily = new FontFamily("Consolas"),
+                FontSize   = 11,
+                FontWeight = FontWeights.Bold,
+                Margin     = new Thickness(0, 4, 0, 0)
+            };
+            inner.Children.Add(statusText);
             inner.Children.Add(infoText);
 
             StackPanel row1 = new StackPanel { Orientation = Orientation.Horizontal };
@@ -1162,6 +1266,29 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [Display(Name = "Show dashboard", Order = 4, GroupName = "6. Display")]
         public bool ShowDashboard { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Pause entries in chop", Description = "Chop = in the lookback, closes crossed the EMA and Globex VWAP at least 'Min crosses' times (both counted together) and the high-low range is within 'Max range'. No new limits, waiting limit cancelled.", Order = 1, GroupName = "7. Chop / trend")]
+        public bool UseChopFilter { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(5, 250)]
+        [Display(Name = "Chop lookback (bars)", Order = 2, GroupName = "7. Chop / trend")]
+        public int ChopLookbackBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name = "Chop min crosses (EMA + VWAP)", Order = 3, GroupName = "7. Chop / trend")]
+        public int ChopMinCrosses { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 1)]
+        [Display(Name = "Chop max efficiency", Description = "Net move / bar-by-bar distance over the lookback. Trend ~0.5+, chop ~0.2 or less. Crosses hit + efficiency at or below this = CHOP; crosses hit alone = Chop risk (warning only).", Order = 4, GroupName = "7. Chop / trend")]
+        public double ChopMaxEfficiency { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade with trend only", Description = "Shorts only when close is below EMA and VWAP (BEARISH), longs only above both (BULLISH). BUY/SELL @EMA buttons bypass this.", Order = 5, GroupName = "7. Chop / trend")]
+        public bool TradeWithTrend { get; set; }
         #endregion
     }
 }
