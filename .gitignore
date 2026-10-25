@@ -6,6 +6,9 @@
 !/README.md
 !/LICENSE
 !/docs/
+!/.claude/
+/.claude/*
+!/.claude/agents/
 
 !/Strategies/
 /Strategies/*
