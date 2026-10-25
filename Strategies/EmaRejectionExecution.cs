@@ -881,6 +881,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopFallback  = false;
                 stopOrder     = null;
                 ownTargetTime = DateTime.MinValue;
+                // TP was planned from the limit price: re-floor it from the actual fill (only ever further)
+                int fdir = o.Name == SigLong ? 1 : -1;
+                double fillTarget;
+                PickTarget(fdir, price, tradeLeg, out fillTarget);
+                if (fdir * (fillTarget - lastSetTarget) > execTick * 0.5)
+                {
+                    ownTargetTime   = DateTime.Now;
+                    preExtendTarget = lastSetTarget;
+                    SetTarget(activeSignal, fillTarget);
+                    Log0("TP re-set from fill -> " + Fmt(fillTarget));
+                }
                 tradesThisSession++;
                 // Setup is used up: a new one has to form after this trade
                 SideState s = o.Name == SigLong ? longSide : shortSide;
