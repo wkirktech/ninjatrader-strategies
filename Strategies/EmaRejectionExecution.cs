@@ -85,6 +85,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TimeZoneInfo easternTz;
         private DateTime vwapSession = DateTime.MinValue;
         private double vwapPV, vwapVol, lastVwap;
+        private int vwapStartBar = -1;
+        private const int VwapWarmupBars = 10;   // VWAP hugs price right after the 18:00 reset; ignore its crosses there
         private bool inChop, chopRisk;
         private int chopEmaX, chopVwapX, trendDir;
         private double chopEfficiency = 1;
@@ -292,7 +294,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             DateTime session = et.AddHours(6).Date;
             if (session != vwapSession)
             {
-                vwapSession = session;
+                vwapSession  = session;
+                vwapStartBar = CurrentBar - c;
                 vwapPV  = 0;
                 vwapVol = 0;
             }
@@ -320,7 +323,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if ((Close[i] > ema[i]) != (Close[i + 1] > ema[i + 1]))
                     chopEmaX++;
-                if (Values[0].IsValidDataPoint(i + 1) && (Close[i] > Values[0][i]) != (Close[i + 1] > Values[0][i + 1]))
+                // VWAP crosses only within this session, after the warm-up (no cross across the reset)
+                if (CurrentBar - (i + 1) >= vwapStartBar + VwapWarmupBars && Values[0].IsValidDataPoint(i + 1) && (Close[i] > Values[0][i]) != (Close[i + 1] > Values[0][i + 1]))
                     chopVwapX++;
                 path += Math.Abs(Close[i] - Close[i + 1]);
             }
@@ -341,7 +345,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return "Trend --";
             string trend = trendDir > 0 ? "BULLISH" : trendDir < 0 ? "BEARISH" : "MIXED";
             string t = "Trend " + trend + "  VWAP " + Fmt(lastVwap) + "\n";
-            t += inChop ? "⚠ CHOP – NO ENTRIES" : chopRisk ? "Chop risk" : "Chop: none";
+            t += inChop ? (UseChopFilter ? "⚠ CHOP – NO ENTRIES" : "CHOP (filter off)") : chopRisk ? "Chop risk" : "Chop: none";
             return t;
         }
         #endregion
@@ -504,9 +508,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             return StartTime <= EndTime ? (t >= StartTime && t < EndTime) : (t >= StartTime || t < EndTime);
         }
 
+        // Newest side that passes the chop / trend filters. If none passes, the newest blocked one, with pauseReason set.
         private SideState PickSide(int c)
         {
-            SideState best = null;
+            SideState best = null, blocked = null;
             foreach (SideState s in new[] { longSide, shortSide })
             {
                 if (Direction == EmaRejDirection.LongOnly && s.Dir < 0) continue;
@@ -516,10 +521,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (s.Extremes.Count < RequiredRejections) continue;
                     if (UseSlopeFilter && s.Dir * (ema[c] - ema[c + SlopeBars]) <= 0) continue;
                 }
+                if (FilterReason(s).Length > 0)
+                {
+                    if (blocked == null || s.LastBar > blocked.LastBar)
+                        blocked = s;
+                    continue;
+                }
                 if (best == null || s.LastBar > best.LastBar)
                     best = s;
             }
-            return best;
+            pauseReason = best == null && blocked != null ? FilterReason(blocked) : "";
+            return best ?? blocked;
+        }
+
+        // Chop / trend pause automatic setups only; BUY/SELL @EMA (forced) always go through
+        private string FilterReason(SideState s)
+        {
+            if (s.Forced)
+                return "";
+            if (UseChopFilter && inChop)
+                return "chop";
+            if (TradeWithTrend && trendDir != s.Dir)
+                return "trend not " + (s.Dir < 0 ? "bearish" : "bullish");
+            return "";
         }
 
         private double Rnd(double price)
@@ -623,16 +647,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             SideState s = PickSide(c);
             planValid = s != null && BuildPlan(s, c);
-
-            // Chop / trend pause automatic setups only; BUY/SELL @EMA (forced) always go through
-            pauseReason = "";
-            if (s != null && !s.Forced)
-            {
-                if (UseChopFilter && inChop)
-                    pauseReason = "chop";
-                else if (TradeWithTrend && trendDir != s.Dir)
-                    pauseReason = "trend not " + (s.Dir < 0 ? "bearish" : "bullish");
-            }
 
             bool allowed = planValid && pauseReason.Length == 0 && armed && CanTradeNow() && InSession(c)
                 && (MaxTradesPerSession <= 0 || tradesThisSession < MaxTradesPerSession);
@@ -897,7 +911,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             string text   = BuildDashboardText();
             string status = StatusText();
-            Brush statusBrush = inChop ? Brushes.Red : chopRisk ? Brushes.Yellow : trendDir > 0 ? Brushes.LimeGreen : trendDir < 0 ? Brushes.Orange : Brushes.Gray;
+            Brush statusBrush = inChop && UseChopFilter ? Brushes.Red : inChop || chopRisk ? Brushes.Yellow : trendDir > 0 ? Brushes.LimeGreen : trendDir < 0 ? Brushes.Orange : Brushes.Gray;
             bool isArmed  = armed;
             string dir    = Direction == EmaRejDirection.Both ? "BOTH" : Direction == EmaRejDirection.LongOnly ? "LONG" : "SHORT";
             chartControlRef.Dispatcher.InvokeAsync(new Action(() =>
@@ -1268,7 +1282,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool ShowDashboard { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Pause entries in chop", Description = "Chop = in the lookback, closes crossed the EMA and Globex VWAP at least 'Min crosses' times (both counted together) and the high-low range is within 'Max range'. No new limits, waiting limit cancelled.", Order = 1, GroupName = "7. Chop / trend")]
+        [Display(Name = "Pause entries in chop", Description = "Chop = in the lookback, closes crossed the EMA and Globex VWAP at least 'Min crosses' times (both counted together) and efficiency (net move / distance travelled) is at or below 'Chop max efficiency'. No new limits, waiting limit cancelled.", Order = 1, GroupName = "7. Chop / trend")]
         public bool UseChopFilter { get; set; }
 
         [NinjaScriptProperty]
