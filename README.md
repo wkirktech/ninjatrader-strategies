@@ -56,6 +56,8 @@ The buttons are:
 - **FLAT+OFF**: cancels the order, closes the position and turns AUTO off
 - **BUY @EMA / SELL @EMA**: forces a setup on that side
 
+Every event (orders, fills, drags, chop, auto on/off) is also written to `Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt`, so a session can be reviewed after a restart.
+
 ### Design notes
 
 - **No repainting.** Setup logic runs only on closed bars. The bar index is offset correctly between historical and realtime processing, so backtest and live behaviour match.
