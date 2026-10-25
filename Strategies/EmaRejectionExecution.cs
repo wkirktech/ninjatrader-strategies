@@ -111,6 +111,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool stopKnown, syncStop, stopFallback;
         private DateTime lastDragTime = DateTime.MinValue;
         private DateTime ownTargetTime = DateTime.MinValue;   // our own TP change in flight: its echoes aren't manual drags
+        private double preExtendTarget;
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -639,7 +640,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             PickTarget(dir, p.AveragePrice, tradeLeg, out target);
             if (dir * (target - lastSetTarget) > execTick * 0.5)
             {
-                ownTargetTime = DateTime.Now;
+                ownTargetTime   = DateTime.Now;
+                preExtendTarget = lastSetTarget;
                 SetTarget(activeSignal, target);
                 Log0("TP extended -> " + Fmt(target));
             }
@@ -834,8 +836,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     bool matchesOurs = Math.Abs(limitPrice - lastSetTarget) <= execTick * 0.5;
                     if (matchesOurs)
                         ownTargetTime = DateTime.MinValue;   // our auto-extend has landed
-                    // Within 3 s of our own auto-extend, an update at another price is a stale echo, not a drag
-                    else if ((DateTime.Now - ownTargetTime).TotalSeconds >= 3)
+                    // Within 3 s of our own auto-extend, an update still at the old target is a stale echo, not a drag
+                    else if ((DateTime.Now - ownTargetTime).TotalSeconds >= 3 || Math.Abs(limitPrice - preExtendTarget) > execTick * 0.5)
                     {
                         targetManual = true;
                         // Tell the managed engine right away, or it puts the TP back on the next tick
