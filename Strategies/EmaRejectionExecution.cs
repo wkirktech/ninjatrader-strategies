@@ -105,10 +105,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double tradeLeg = double.NaN;
         private double lastSetTarget;
         private bool targetManual;
-        // Drag rules: stop may only be tightened, TP may only be moved further; anything else snaps back
-        private Order stopOrder, targetOrder;
+        // Drag rules: stop may only be tightened (a looser stop snaps back); TP can be dragged anywhere
+        private Order stopOrder;
         private double lastSetStop, tradeEntry;
-        private bool stopKnown, snapStop, snapTarget;
+        private bool stopKnown, syncStop;
+        private DateTime lastDragTime = DateTime.MinValue;
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -624,11 +625,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             return true;
         }
 
-        // In a trade: keep following the leg, only ever moving the target further (beyond a TP dragged further by hand too).
+        // In a trade: keep following the leg, only ever moving the target further. A TP dragged on the chart is left alone.
         private void UpdateTradeTarget(int c)
         {
             Position p = Positions[execIdx];
-            if (!tradeOpen || p.MarketPosition == MarketPosition.Flat)
+            if (!tradeOpen || targetManual || p.MarketPosition == MarketPosition.Flat)
                 return;
             int dir = p.MarketPosition == MarketPosition.Long ? 1 : -1;
             double target;
@@ -636,7 +637,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             PickTarget(dir, p.AveragePrice, tradeLeg, out target);
             if (dir * (target - lastSetTarget) > execTick * 0.5)
             {
-                targetManual = false;
                 SetTarget(activeSignal, target);
                 Log0("TP extended -> " + Fmt(target));
             }
@@ -729,21 +729,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 CancelOrder(entryOrder);
         }
 
-        // Put back a stop dragged further away or a TP dragged closer (flagged in OnOrderUpdate)
+        // Put back a stop dragged further away (flagged in OnOrderUpdate). Waits until the drag has settled for a
+        // second and the order has no change in flight, so it never fights the user.
         private void EnforceExitDrags()
         {
-            if (snapStop && stopOrder != null && !Order.IsTerminalState(stopOrder.OrderState))
+            if (!syncStop || (DateTime.Now - lastDragTime).TotalSeconds < 1)
+                return;
+            if (Settled(stopOrder))
             {
-                ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
-                Log0("SL can only be tightened, back to " + Fmt(lastSetStop));
+                SetStopLoss(activeSignal, CalculationMode.Price, lastSetStop, false);
+                syncStop = false;
+                // Engine already held this price and left the order alone: put a looser stop back directly
+                if (Settled(stopOrder) && Math.Abs(stopOrder.StopPrice - lastSetStop) > execTick * 0.5)
+                    ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
             }
-            if (snapTarget && targetOrder != null && !Order.IsTerminalState(targetOrder.OrderState))
-            {
-                ChangeOrder(targetOrder, targetOrder.Quantity, lastSetTarget, 0);
-                Log0("TP can only move further, back to " + Fmt(lastSetTarget));
-            }
-            snapStop   = false;
-            snapTarget = false;
+        }
+
+        private static bool Settled(Order o)
+        {
+            return o != null && (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted);
         }
 
         private void ManageProfitLock()
@@ -774,7 +778,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filled,
             double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string nativeError)
         {
-            // Exits dragged on the chart: tighter stop / further TP are kept; a looser stop or closer TP snaps back on the next tick
+            // Exits dragged on the chart: a tighter stop is kept, a looser one is put back; the TP is kept wherever it is dropped
             if (tradeOpen && (orderState == OrderState.Working || orderState == OrderState.Accepted))
             {
                 int dir = activeSignal == SigLong ? 1 : -1;
@@ -784,26 +788,31 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double d = dir * (stopPrice - lastSetStop);
                     if (!stopKnown || d > execTick * 0.5)
                     {
-                        if (stopKnown)
-                            Log0("SL tightened manually -> " + Fmt(stopPrice));
                         lastSetStop = stopPrice;
-                        stopKnown   = true;
+                        if (stopKnown)
+                        {
+                            // Tell the managed engine right away, or it puts the stop back on the next tick
+                            SetStopLoss(activeSignal, CalculationMode.Price, stopPrice, false);
+                            Log0("SL tightened manually -> " + Fmt(stopPrice));
+                        }
+                        stopKnown = true;
                     }
                     else if (d < -execTick * 0.5)
-                        snapStop = true;
+                    {
+                        Log0("SL can only be tightened, back to " + Fmt(lastSetStop));
+                        lastDragTime = DateTime.Now;
+                        syncStop     = true;
+                    }
                 }
                 else if (order.Name == "Profit target")
                 {
-                    targetOrder = order;
-                    double d = dir * (limitPrice - lastSetTarget);
-                    if (d > execTick * 0.5)
+                    if (Math.Abs(limitPrice - lastSetTarget) > execTick * 0.5)
                     {
-                        targetManual  = true;
-                        lastSetTarget = limitPrice;
-                        Log0("TP moved further manually -> " + Fmt(limitPrice));
+                        targetManual = true;
+                        // Tell the managed engine right away, or it puts the TP back on the next tick
+                        SetTarget(activeSignal, limitPrice);
+                        Log0("TP moved manually -> " + Fmt(limitPrice));
                     }
-                    else if (d < -execTick * 0.5)
-                        snapTarget = true;
                 }
             }
 
@@ -834,11 +843,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeLeg     = planLeg;
                 targetManual = false;
                 tradeEntry   = price;
-                stopKnown    = false;
-                snapStop     = false;
-                snapTarget   = false;
+                // Stop was sent as StopLossPts from the fill: know it now, so even the first drag is checked
+                lastSetStop  = Rnd(price - (o.Name == SigLong ? 1 : -1) * StopLossPts);
+                stopKnown    = true;
+                syncStop     = false;
                 stopOrder    = null;
-                targetOrder  = null;
                 tradesThisSession++;
                 // Setup is used up: a new one has to form after this trade
                 SideState s = o.Name == SigLong ? longSide : shortSide;
@@ -1147,12 +1156,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 s.Forced     = true;
                 s.ForcedBar  = CurrentBar;
                 // Leg starts at the highest high (short) / lowest low (long) of the lookback, so the target sees the whole move
-                int look = Math.Min(Math.Min(SetupLookbackBars, CurrentBar), 250);
+                // Always the chart series: a custom event can run with the execution series as context
+                int look = Math.Min(Math.Min(SetupLookbackBars, CurrentBars[0]), 250);
                 int best = 0;
                 for (int i = 1; i <= look; i++)
-                    if (s.Dir < 0 ? High[i] > High[best] : Low[i] < Low[best])
+                    if (s.Dir < 0 ? Highs[0][i] > Highs[0][best] : Lows[0][i] < Lows[0][best])
                         best = i;
-                s.ForcedAnchor = CurrentBar - best;
+                s.ForcedAnchor = CurrentBars[0] - best;
                 s.ClosesBeyond = 0;
                 armed = true;
                 Log0((s.Dir > 0 ? "BUY" : "SELL") + " @EMA forced, AUTO ON");
