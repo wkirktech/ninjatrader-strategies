@@ -105,6 +105,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double tradeLeg = double.NaN;
         private double lastSetTarget;
         private bool targetManual;
+        // Drag rules: stop may only be tightened, TP may only be moved further; anything else snaps back
+        private Order stopOrder, targetOrder;
+        private double lastSetStop, tradeEntry;
+        private bool stopKnown, snapStop, snapTarget;
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -198,6 +202,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string exec = ExecutionInstrument == null ? "" : ExecutionInstrument.Trim();
                 if (exec.Length == 0 && ExecuteOnMicro)
                     exec = MicroOf(Instrument);
+                // A bare root ("NQ", "MNQ") takes the chart's contract month, so "NQ" on an NQ chart trades the chart itself
+                if (exec.Length > 0 && exec.IndexOf(' ') < 0 && Instrument != null
+                    && Instrument.FullName.StartsWith(Instrument.MasterInstrument.Name))
+                    exec = exec.ToUpper() + Instrument.FullName.Substring(Instrument.MasterInstrument.Name.Length);
                 if (exec.Length > 0 && (Instrument == null || !string.Equals(exec, Instrument.FullName, StringComparison.OrdinalIgnoreCase)))
                 {
                     AddDataSeries(exec);
@@ -260,7 +268,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             if (BarsInProgress == execIdx)
+            {
+                EnforceExitDrags();
                 ManageProfitLock();
+            }
 
             if (BarsInProgress != 0 || !IsFirstTickOfBar)
                 return;
@@ -613,11 +624,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             return true;
         }
 
-        // In a trade: keep following the leg, only ever moving the target further. A TP dragged on the chart is left alone.
+        // In a trade: keep following the leg, only ever moving the target further (beyond a TP dragged further by hand too).
         private void UpdateTradeTarget(int c)
         {
             Position p = Positions[execIdx];
-            if (!tradeOpen || targetManual || p.MarketPosition == MarketPosition.Flat)
+            if (!tradeOpen || p.MarketPosition == MarketPosition.Flat)
                 return;
             int dir = p.MarketPosition == MarketPosition.Long ? 1 : -1;
             double target;
@@ -625,6 +636,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             PickTarget(dir, p.AveragePrice, tradeLeg, out target);
             if (dir * (target - lastSetTarget) > execTick * 0.5)
             {
+                targetManual = false;
                 SetTarget(activeSignal, target);
                 Log0("TP extended -> " + Fmt(target));
             }
@@ -717,6 +729,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                 CancelOrder(entryOrder);
         }
 
+        // Put back a stop dragged further away or a TP dragged closer (flagged in OnOrderUpdate)
+        private void EnforceExitDrags()
+        {
+            if (snapStop && stopOrder != null && !Order.IsTerminalState(stopOrder.OrderState))
+            {
+                ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
+                Log0("SL can only be tightened, back to " + Fmt(lastSetStop));
+            }
+            if (snapTarget && targetOrder != null && !Order.IsTerminalState(targetOrder.OrderState))
+            {
+                ChangeOrder(targetOrder, targetOrder.Quantity, lastSetTarget, 0);
+                Log0("TP can only move further, back to " + Fmt(lastSetTarget));
+            }
+            snapStop   = false;
+            snapTarget = false;
+        }
+
         private void ManageProfitLock()
         {
             if (!UseProfitLock || profitLocked || !tradeOpen)
@@ -732,8 +761,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             double lockPx = Rnd(isLong ? p.AveragePrice + ProfitLockPts : p.AveragePrice - ProfitLockPts);
-            SetStopLoss(activeSignal, CalculationMode.Price, lockPx, false);
             profitLocked = true;
+            // Never loosen a stop that was already tightened by hand past the lock level
+            if (stopKnown && (isLong ? 1 : -1) * (lockPx - lastSetStop) <= execTick * 0.5)
+                return;
+            lastSetStop = lockPx;
+            SetStopLoss(activeSignal, CalculationMode.Price, lockPx, false);
             Log0("Profit lock: stop -> " + Fmt(lockPx));
             RefreshUi();
         }
@@ -741,14 +774,37 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filled,
             double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string nativeError)
         {
-            // TP moved by hand on the chart: stop auto-updating it for this trade
-            if (order.Name == "Profit target" && tradeOpen && !targetManual
-                && (orderState == OrderState.Working || orderState == OrderState.Accepted)
-                && Math.Abs(limitPrice - lastSetTarget) > execTick * 0.5)
+            // Exits dragged on the chart: tighter stop / further TP are kept; a looser stop or closer TP snaps back on the next tick
+            if (tradeOpen && (orderState == OrderState.Working || orderState == OrderState.Accepted))
             {
-                targetManual  = true;
-                lastSetTarget = limitPrice;
-                Log0("TP moved manually -> " + Fmt(limitPrice));
+                int dir = activeSignal == SigLong ? 1 : -1;
+                if (order.Name == "Stop loss")
+                {
+                    stopOrder = order;
+                    double d = dir * (stopPrice - lastSetStop);
+                    if (!stopKnown || d > execTick * 0.5)
+                    {
+                        if (stopKnown)
+                            Log0("SL tightened manually -> " + Fmt(stopPrice));
+                        lastSetStop = stopPrice;
+                        stopKnown   = true;
+                    }
+                    else if (d < -execTick * 0.5)
+                        snapStop = true;
+                }
+                else if (order.Name == "Profit target")
+                {
+                    targetOrder = order;
+                    double d = dir * (limitPrice - lastSetTarget);
+                    if (d > execTick * 0.5)
+                    {
+                        targetManual  = true;
+                        lastSetTarget = limitPrice;
+                        Log0("TP moved further manually -> " + Fmt(limitPrice));
+                    }
+                    else if (d < -execTick * 0.5)
+                        snapTarget = true;
+                }
             }
 
             if (order.Name != SigLong && order.Name != SigShort)
@@ -777,6 +833,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeAnchor  = planAnchor;
                 tradeLeg     = planLeg;
                 targetManual = false;
+                tradeEntry   = price;
+                stopKnown    = false;
+                snapStop     = false;
+                snapTarget   = false;
+                stopOrder    = null;
+                targetOrder  = null;
                 tradesThisSession++;
                 // Setup is used up: a new one has to form after this trade
                 SideState s = o.Name == SigLong ? longSide : shortSide;
@@ -785,7 +847,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (o.Name == "Stop loss" && o.OrderState == OrderState.Filled)
             {
-                if (profitLocked)
+                // A stop at or past entry (profit lock, or tightened by hand) is not a full stop-loss
+                int dir = activeSignal == SigLong ? 1 : -1;
+                if (profitLocked || (stopKnown && dir * (lastSetStop - tradeEntry) >= 0))
                 {
                     Log0("Profit-lock stop hit, setup ended");
                     if (DisarmOnProfitLockStop) Disarm("profit-lock stop");
