@@ -108,8 +108,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Drag rules: stop may only be tightened (a looser stop snaps back); TP can be dragged anywhere
         private Order stopOrder;
         private double lastSetStop, tradeEntry;
-        private bool stopKnown, syncStop;
+        private bool stopKnown, syncStop, stopFallback;
         private DateTime lastDragTime = DateTime.MinValue;
+        private DateTime ownTargetTime = DateTime.MinValue;   // our own TP change in flight: its echoes aren't manual drags
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -139,7 +140,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TimeInForce                                 = TimeInForce.Gtc;
                 TraceOrders                                 = false;
                 RealtimeErrorHandling                       = RealtimeErrorHandling.StopCancelClose;
-                StopTargetHandling                          = StopTargetHandling.PerEntryExecution;
+                // One stop + one target for the whole position (partial fills don't create extra stops the drag rules can't see)
+                StopTargetHandling                          = StopTargetHandling.ByStrategyPosition;
                 BarsRequiredToTrade                         = 20;
                 IsInstantiatedOnEachOptimizationIteration   = true;
 
@@ -637,6 +639,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             PickTarget(dir, p.AveragePrice, tradeLeg, out target);
             if (dir * (target - lastSetTarget) > execTick * 0.5)
             {
+                ownTargetTime = DateTime.Now;
                 SetTarget(activeSignal, target);
                 Log0("TP extended -> " + Fmt(target));
             }
@@ -733,16 +736,37 @@ namespace NinjaTrader.NinjaScript.Strategies
         // second and the order has no change in flight, so it never fights the user.
         private void EnforceExitDrags()
         {
-            if (!syncStop || (DateTime.Now - lastDragTime).TotalSeconds < 1)
+            if (!syncStop || (DateTime.Now - lastDragTime).TotalSeconds < 1 || !Settled(stopOrder))
                 return;
-            if (Settled(stopOrder))
+            Position p = Positions[execIdx];
+            if (p.MarketPosition == MarketPosition.Flat)
+            {
+                syncStop = stopFallback = false;
+                return;
+            }
+
+            // Price already through the allowed stop: a stop there would be rejected (and the strategy shut down), so exit now
+            bool isLong = p.MarketPosition == MarketPosition.Long;
+            double px = State == State.Realtime ? (isLong ? GetCurrentBid(execIdx) : GetCurrentAsk(execIdx)) : Closes[execIdx][0];
+            if (isLong ? px <= lastSetStop : px >= lastSetStop)
+            {
+                syncStop = stopFallback = false;
+                Log0("Price through allowed stop " + Fmt(lastSetStop) + ", exiting at market");
+                if (isLong) ExitLong(execIdx, p.Quantity, "Stop put-back", activeSignal);
+                else        ExitShort(execIdx, p.Quantity, "Stop put-back", activeSignal);
+                return;
+            }
+
+            if (!stopFallback)
             {
                 SetStopLoss(activeSignal, CalculationMode.Price, lastSetStop, false);
-                syncStop = false;
-                // Engine already held this price and left the order alone: put a looser stop back directly
-                if (Settled(stopOrder) && Math.Abs(stopOrder.StopPrice - lastSetStop) > execTick * 0.5)
-                    ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
+                stopFallback = true;   // check again on a later tick, once this change has had time to land
+                return;
             }
+            // Engine already held this price and left the order alone: put a looser stop back directly
+            if (Math.Abs(stopOrder.StopPrice - lastSetStop) > execTick * 0.5)
+                ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
+            syncStop = stopFallback = false;
         }
 
         private static bool Settled(Order o)
@@ -802,11 +826,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                         Log0("SL can only be tightened, back to " + Fmt(lastSetStop));
                         lastDragTime = DateTime.Now;
                         syncStop     = true;
+                        stopFallback = false;
                     }
                 }
                 else if (order.Name == "Profit target")
                 {
-                    if (Math.Abs(limitPrice - lastSetTarget) > execTick * 0.5)
+                    bool matchesOurs = Math.Abs(limitPrice - lastSetTarget) <= execTick * 0.5;
+                    if (matchesOurs)
+                        ownTargetTime = DateTime.MinValue;   // our auto-extend has landed
+                    // Within 3 s of our own auto-extend, an update at another price is a stale echo, not a drag
+                    else if ((DateTime.Now - ownTargetTime).TotalSeconds >= 3)
                     {
                         targetManual = true;
                         // Tell the managed engine right away, or it puts the TP back on the next tick
@@ -845,16 +874,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeEntry   = price;
                 // Stop was sent as StopLossPts from the fill: know it now, so even the first drag is checked
                 lastSetStop  = Rnd(price - (o.Name == SigLong ? 1 : -1) * StopLossPts);
-                stopKnown    = true;
-                syncStop     = false;
-                stopOrder    = null;
+                stopKnown     = true;
+                syncStop      = false;
+                stopFallback  = false;
+                stopOrder     = null;
+                ownTargetTime = DateTime.MinValue;
                 tradesThisSession++;
                 // Setup is used up: a new one has to form after this trade
                 SideState s = o.Name == SigLong ? longSide : shortSide;
                 s.Reset(false);
                 Log0((o.Name == SigLong ? "LONG" : "SHORT") + " filled @ " + Fmt(price));
             }
-            else if (o.Name == "Stop loss" && o.OrderState == OrderState.Filled)
+            else if ((o.Name == "Stop loss" || o.Name == "Stop put-back") && o.OrderState == OrderState.Filled)
             {
                 // A stop at or past entry (profit lock, or tightened by hand) is not a full stop-loss
                 int dir = activeSignal == SigLong ? 1 : -1;
