@@ -19,7 +19,7 @@ switch ($Job) {
         $agent  = 'market-regime'
         $tools  = 'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'
         $prompt = "Pre-session brief for today's NQ session, $today. Follow your instructions. " +
-                  "Prior-session levels are in the latest strategy logs in ..\..\log\ (EmaRejection.*.txt); if none, mark them unknown. " +
+                  "Levels are in ..\..nalysis\levels.txt (written by the strategy while the chart runs) and the Session start lines in ..\..\log\EmaRejection.*.txt; if neither has them, mark levels unknown. " +
                   "Your reply is saved as the brief, so reply with the brief only."
     }
     'review' {
