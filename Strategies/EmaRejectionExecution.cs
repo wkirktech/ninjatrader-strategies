@@ -881,6 +881,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopFallback  = false;
                 stopOrder     = null;
                 ownTargetTime = DateTime.MinValue;
+                // TP was planned from the limit price: re-floor it from the actual fill (only ever further)
+                int fdir = o.Name == SigLong ? 1 : -1;
+                double fillTarget;
+                PickTarget(fdir, price, tradeLeg, out fillTarget);
+                if (fdir * (fillTarget - lastSetTarget) > execTick * 0.5)
+                {
+                    ownTargetTime   = DateTime.Now;
+                    preExtendTarget = lastSetTarget;
+                    SetTarget(activeSignal, fillTarget);
+                    Log0("TP re-set from fill -> " + Fmt(fillTarget));
+                }
                 tradesThisSession++;
                 // Setup is used up: a new one has to form after this trade
                 SideState s = o.Name == SigLong ? longSide : shortSide;
@@ -951,8 +962,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void Log0(string msg)
         {
             lastEvent = (CurrentBars[0] >= 0 ? Times[0][0].ToString("HH:mm:ss") + " " : "") + msg;
-            if (State == State.Realtime)
-                Print(Name + " " + Instruments[execIdx].FullName + ": " + lastEvent);
+            if (State != State.Realtime)
+                return;
+            string line = Name + " " + Instruments[execIdx].FullName + ": " + lastEvent;
+            Print(line);
+            WriteLogFile(line);
+        }
+
+        // Same lines as the Output window, also kept in Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt
+        // (prefixed with the PC clock) so they survive a restart and can be read without copy-pasting.
+        private static readonly object logFileLock = new object();
+
+        private void WriteLogFile(string line)
+        {
+            try
+            {
+                string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "log",
+                    "EmaRejection." + DateTime.Now.ToString("yyyyMMdd") + ".txt");
+                lock (logFileLock)
+                    System.IO.File.AppendAllText(path, DateTime.Now.ToString("HH:mm:ss.fff") + " " + Account.Name + " " + line + Environment.NewLine);
+            }
+            catch (Exception) { }   // logging must never stop the strategy
         }
 
         private string SideLine(SideState s)
@@ -1200,6 +1230,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 armed = true;
                 Log0((s.Dir > 0 ? "BUY" : "SELL") + " @EMA forced, AUTO ON");
                 ManageEntry(0);
+                if (entryOrder == null && planValid && planTooClose)
+                    Log0((s.Dir > 0 ? "BUY" : "SELL") + " waiting: needs price " + (s.Dir > 0 ? ">= " : "<= ")
+                        + Fmt(planEntry + s.Dir * MinDistFromPricePts) + " (entry " + Fmt(planEntry) + ")");
                 DrawPlan();
                 RefreshUi();
             }, 0, null);
