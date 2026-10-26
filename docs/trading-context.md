@@ -14,7 +14,7 @@ Paths are relative to the repo root, `NinjaTrader 8\bin\Custom` (Documents may s
 |---|---|---|
 | `..\..\log\EmaRejection.yyyyMMdd.txt` | strategy events: orders, fills, drags, chop, auto on/off | the strategy |
 | `..\..\log\log.yyyyMMdd.*.txt` | NinjaTrader order states and fill prices | NinjaTrader |
-| `..\..\analysis\*.csv` | Strategy Analyzer trade exports | the user |
+| `..\..\analysis\*.csv` | Strategy Analyzer trade exports (Trades tab → right-click → Export, CSV) | the user |
 | `..\..\analysis\playbook.md` | adopted playbook cards | strategy-analyst |
 | `..\..\analysis\sizing.md` | approved size per account and grade | from risk-manager's verdict |
 | `..\..\analysis\lessons.md` | one-line lessons, append-only | strategy-analyst, market-regime |
@@ -31,7 +31,7 @@ Paths are relative to the repo root, `NinjaTrader 8\bin\Custom` (Documents may s
 Size (contracts), entry, stop loss, take profit, grade, exit price, result in R. A trade missing any of these is flagged; one that can't be reconstructed is excluded and counted.
 
 ## Grades and size
-| Grade | Conditions (hypothesis, the data confirms or changes it) | Size, MNQ |
+| Grade | Conditions (hypothesis, the data confirms or changes it) | Starting size, MNQ (scale per account) |
 |---|---|---|
 | A+ | planned reward ≥ 3R, with higher-timeframe trend, not in chop, at a key level (PDH/PDL, VAH/VAL, VWAP) | max: 3–4 |
 | A | planned reward ≥ 2R, with trend | average: 2–3 |
@@ -42,9 +42,9 @@ Size (contracts), entry, stop loss, take profit, grade, exit price, result in R.
 - No entry in `sizing.md` for an account: B size only.
 
 ## Accounts
-- Prop firms: Tradeify and Lucid. Drawdown $1,000–2,000 depending on the account. Some plans trail intraday, others end-of-day; check per account and note where the floor stops trailing.
+- Prop firms: Tradeify and Lucid. Drawdown $1,000–2,000 depending on the account. Some plans trail intraday, others end-of-day; check per account and note where the floor stops trailing (often at the starting balance).
 - With intraday trailing, the floor follows the highest **open** equity. A trade that runs +30 pts then stops at −25 costs 55 pts of room.
-- Firm rules change. Confirm against the firm's current rulebook before relying on one.
+- The table below holds the user's rules. Firm rules change: ask the user to confirm against the firm's current rulebook before relying on one.
 - The eval budget is limited: avoid buying evals until forward tests support the strategy.
 - TradeSpacePro enforces account rules outside NinjaTrader and stays as an independent safety net. The strategy's own limits should trip before it does.
 
