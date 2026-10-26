@@ -90,7 +90,7 @@ Every event (orders, fills, drags, chop, auto on/off) is also written to `Docume
 - **review** (weekdays, after the close): session review and one lesson
 - **weekly** (Saturday): roll-up with at most one proposed change
 
-Register them in Windows Task Scheduler with `tools/register-agent-tasks.ps1` (`-Remove` to delete). They run only while you are logged on, with read-only tools plus writes to the analysis folder.
+Register them in Windows Task Scheduler with `tools/register-agent-tasks.ps1` (`-Remove` to delete). They run only while you are logged on, with read-only tools: no job can write, edit or run code. The script passes files in and appends the review's lesson itself.
 
 ## Development workflow
 
