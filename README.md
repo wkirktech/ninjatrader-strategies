@@ -81,6 +81,17 @@ Every event (orders, fills, drags, chop, auto on/off) is also written to `Docume
 
 ---
 
+## Agents
+
+`.claude/agents/` holds Claude Code agents for this repo: code-reviewer, debugger, strategy-analyst, risk-manager and market-regime. They share the facts in [docs/trading-context.md](docs/trading-context.md). Code makes every live trading decision; the agents work offline.
+
+`tools/run-agent.ps1` runs a scheduled job headless and saves the result to `Documents\NinjaTrader 8\analysis\briefs\`:
+- **premarket** (weekdays): levels, news and regime brief
+- **review** (weekdays, after the close): session review and one lesson
+- **weekly** (Saturday): roll-up with at most one proposed change
+
+Register them in Windows Task Scheduler with `tools/register-agent-tasks.ps1` (`-Remove` to delete). They run only while you are logged on, with read-only tools plus writes to the analysis folder.
+
 ## Development workflow
 
 - `main`: stable, tested releases (tagged, e.g. `v1.0.0`).
