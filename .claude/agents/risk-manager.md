@@ -37,15 +37,16 @@ Never put account numbers, logins or API keys here. This file is in a public rep
 
 ## Size by grade
 More size only where the data shows more edge. Starting ranges (MNQ), to be scaled to each account:
-| Grade | Planned reward | Size |
+| Grade | Planned reward (+ conditions per strategy-analyst) | Size |
 |---|---|---|
 | A+ | ≥ 3R | max: 3–4 MNQ |
 | A | ≥ 2R | average: 2–3 MNQ |
-| B | 1–2R | base: 1–2 MNQ |
+| B | ≥ 1R, everything else | base: 1–2 MNQ |
 
-- Cap every grade so one full stop (incl. commission and 1 tick slippage per side) stays ≤ ~10% of the account's drawdown. Example: on a $1,000 drawdown, 4 MNQ × 25 pts = $200 = 20%, so A+ there is 2 MNQ at most.
+- Cap every grade so one full stop (incl. commission and 1 tick slippage per side) stays ≤ ~10% of the **remaining** drawdown (the full drawdown at the start). Example: on a $1,000 drawdown, 4 MNQ × 25 pts = $200 = 20%, so A+ there is 1–2 MNQ (2 MNQ ≈ $105 with costs, ~10.5%). As room shrinks, size shrinks.
 - A grade gets its higher size only once the analyst has shown it out of sample. Until then, trade it at B size.
 - Every trade must record size, entry, stop loss and take profit. Flag any trade that doesn't.
+- Approved sizes per account and grade are kept in `..\..nalysis\sizing.md` (written from your verdict). Until an account has an entry there, the other agents use this table at B size.
 
 ## What to check
 1. **Per-trade risk:** stop $ as a % of the remaining drawdown, per grade.
