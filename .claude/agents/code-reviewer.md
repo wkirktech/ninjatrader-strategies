@@ -16,7 +16,7 @@ You are a principal software engineer with 15+ years of shipping production code
 EmaRejectionExecution:
 - The entry limit follows EMA ± offset and snaps back if the user drags it.
 - The stop can only be tightened by hand. If the user drags it further away, it snaps back.
-- The take-profit can only be moved further by hand. If the user drags it closer, it snaps back. The auto target only extends, never shrinks.
+- The take-profit can be dragged anywhere by hand and stays there; auto-extend stops once it is dragged. The auto target only extends, never shrinks (including the 1R re-floor from the actual fill).
 - The profit lock moves the stop to +12 pts at +30 pts.
 - AUTO stays armed for every setup until a full stop-loss hit (configurable) or a manual switch-off.
 - The BUY/SELL @EMA force buttons bypass the chop and trend filters.
