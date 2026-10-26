@@ -217,6 +217,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 DailyStopUsd            = 0;
                 MaxLossesPerDay         = 3;
+                CostPerContractUsd      = 2.5;
 
                 AddPlot(Brushes.Orange, "VWAP");
             }
@@ -790,7 +791,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return dayStopReason;
             if (MaxTradesPerSession > 0 && tradesThisSession >= MaxTradesPerSession)
                 return "max trades";
-            double risk = StopLossPts * Instruments[execIdx].MasterInstrument.PointValue * Contracts;
+            double risk = (StopLossPts * Instruments[execIdx].MasterInstrument.PointValue + CostPerContractUsd) * Contracts;
             if (DailyStopUsd > 0 && dayPnl - risk < -DailyStopUsd)
                 return "daily stop: a full stop (" + Usd(-risk) + ") would pass it";
             return "";
@@ -823,11 +824,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (pnl < 0)
                 dayLosses++;
             Log0("Trade closed " + Usd(pnl) + " (" + pts.ToString("0.##") + " pts), day " + Usd(dayPnl));
+            CheckDayLimits();   // before the file write, so a slow or locked file can't delay AUTO OFF
             WriteJournal(entryPx, exitPx, pts, pnl);
             // Booked: a late entry partial after this starts a fresh tally
             tradeQty   = exitQty = 0;
             entryValue = exitValue = tradeCommission = 0;
-            CheckDayLimits();
         }
 
         private const string JournalHeader = "date,open_et,close_et,account,instrument,side,contracts,entry,stop_initial,tp_initial,"
@@ -1092,8 +1093,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (o.Name == "Profit target" && o.OrderState == OrderState.Filled)
                 Log0("TARGET hit @ " + Fmt(price));
 
-            // Every fill of the open trade (partials included), for the journal and the day P&L
-            if (tradeOpen && execution.Instrument == Instruments[execIdx])
+            // Every fill of the open trade (partials included), for the journal and the day P&L.
+            // tradeQty > 0 keeps exits counted even if the Flat position update arrives before the last exit fill.
+            if ((tradeOpen || tradeQty > 0) && execution.Instrument == Instruments[execIdx])
             {
                 tradeCommission += execution.Commission;
                 if (o.Name == SigLong || o.Name == SigShort)
@@ -1197,7 +1199,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         System.IO.File.WriteAllText(path, text);
                 }
             }
-            catch (Exception) { }   // same: never stop the strategy
+            catch (Exception ex) { Print(Name + ": could not write analysis\\" + name + " (" + ex.Message + ")"); }   // never stop the strategy
         }
 
         private string SideLine(SideState s)
@@ -1665,13 +1667,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(0, double.MaxValue)]
-        [Display(Name = "Daily stop ($, 0 = off)", Description = "No new entry if a full stop on the next trade would take the day's closed P&L below -this. Set just inside the account's own daily limit (e.g. TradeSpacePro). Resets at the session start; with Max trades per session, these are the day limits.", Order = 1, GroupName = "8. Day limits")]
+        [Display(Name = "Daily stop ($, 0 = off)", Description = "No new entry if a full stop on the next trade (plus costs) would take the day's closed P&L below -this. Set just inside the account's own daily limit (e.g. TradeSpacePro). Resets at the chart's session start, so use an ETH (18:00 ET) trading-hours template; with Max trades per session, these are the day limits.", Order = 1, GroupName = "8. Day limits")]
         public double DailyStopUsd { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, int.MaxValue)]
-        [Display(Name = "Max losing trades per day (0 = off)", Order = 2, GroupName = "8. Day limits")]
+        [Display(Name = "Max losing trades per day (0 = off)", Description = "A trade counts as a loss when its net P&L (after commission) is below 0, so a breakeven scratch counts.", Order = 2, GroupName = "8. Day limits")]
         public int MaxLossesPerDay { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Cost per contract ($, round trip)", Description = "Commission plus expected slippage, added to the stop when checking the daily stop.", Order = 3, GroupName = "8. Day limits")]
+        public double CostPerContractUsd { get; set; }
         #endregion
     }
 }
