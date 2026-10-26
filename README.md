@@ -35,8 +35,8 @@ Built for NQ / MNQ index futures on fast execution charts (377-tick, 1-min, 3-mi
 | | Behaviour |
 |---|---|
 | **Entry** | Limit at EMA − offset (short) / EMA + offset (long). It is moved with the EMA every bar, and only placed while it can rest a minimum distance away from the market, so it never fills instantly. |
-| **Stop** | Fixed points from the fill (default 25). |
-| **Target** | The setup's lower low (short) / higher high (long) plus a buffer, never closer than a minimum R-multiple (default 1:1). It extends with the leg, and once you move it by hand the strategy leaves it alone. |
+| **Stop** | Fixed points from the fill (default 25). You can drag it tighter; if you drag it further away, it snaps back. |
+| **Target** | The setup's lower low (short) / higher high (long) plus a buffer, never closer than a minimum R-multiple (default 1:1). It extends with the leg until you drag it; wherever you drop it, it stays. |
 | **Profit lock** | At +30 pts the stop moves to +12 pts (both configurable). |
 | **Automation** | Stays armed and takes every new setup until a full stop-loss hit (configurable), or until you switch it off. |
 
@@ -55,6 +55,8 @@ The buttons are:
 - **Direction** (Both / Long / Short)
 - **FLAT+OFF**: cancels the order, closes the position and turns AUTO off
 - **BUY @EMA / SELL @EMA**: forces a setup on that side
+
+Every event (orders, fills, drags, chop, auto on/off) is also written to `Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt`, so a session can be reviewed after a restart.
 
 ### Design notes
 

@@ -105,6 +105,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double tradeLeg = double.NaN;
         private double lastSetTarget;
         private bool targetManual;
+        // Drag rules: stop may only be tightened (a looser stop snaps back); TP can be dragged anywhere
+        private Order stopOrder;
+        private double lastSetStop, tradeEntry;
+        private bool stopKnown, syncStop, stopFallback;
+        private DateTime lastDragTime = DateTime.MinValue;
+        private DateTime ownTargetTime = DateTime.MinValue;   // our own TP change in flight: its echoes aren't manual drags
+        private double preExtendTarget;
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -134,7 +141,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TimeInForce                                 = TimeInForce.Gtc;
                 TraceOrders                                 = false;
                 RealtimeErrorHandling                       = RealtimeErrorHandling.StopCancelClose;
-                StopTargetHandling                          = StopTargetHandling.PerEntryExecution;
+                // One stop + one target for the whole position (partial fills don't create extra stops the drag rules can't see)
+                StopTargetHandling                          = StopTargetHandling.ByStrategyPosition;
                 BarsRequiredToTrade                         = 20;
                 IsInstantiatedOnEachOptimizationIteration   = true;
 
@@ -198,6 +206,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string exec = ExecutionInstrument == null ? "" : ExecutionInstrument.Trim();
                 if (exec.Length == 0 && ExecuteOnMicro)
                     exec = MicroOf(Instrument);
+                // A bare root ("NQ", "MNQ") takes the chart's contract month, so "NQ" on an NQ chart trades the chart itself
+                if (exec.Length > 0 && exec.IndexOf(' ') < 0 && Instrument != null
+                    && Instrument.FullName.StartsWith(Instrument.MasterInstrument.Name))
+                    exec = exec.ToUpper() + Instrument.FullName.Substring(Instrument.MasterInstrument.Name.Length);
                 if (exec.Length > 0 && (Instrument == null || !string.Equals(exec, Instrument.FullName, StringComparison.OrdinalIgnoreCase)))
                 {
                     AddDataSeries(exec);
@@ -260,7 +272,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             if (BarsInProgress == execIdx)
+            {
+                EnforceExitDrags();
                 ManageProfitLock();
+            }
 
             if (BarsInProgress != 0 || !IsFirstTickOfBar)
                 return;
@@ -625,6 +640,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             PickTarget(dir, p.AveragePrice, tradeLeg, out target);
             if (dir * (target - lastSetTarget) > execTick * 0.5)
             {
+                ownTargetTime   = DateTime.Now;
+                preExtendTarget = lastSetTarget;
                 SetTarget(activeSignal, target);
                 Log0("TP extended -> " + Fmt(target));
             }
@@ -717,6 +734,48 @@ namespace NinjaTrader.NinjaScript.Strategies
                 CancelOrder(entryOrder);
         }
 
+        // Put back a stop dragged further away (flagged in OnOrderUpdate). Waits until the drag has settled for a
+        // second and the order has no change in flight, so it never fights the user.
+        private void EnforceExitDrags()
+        {
+            if (!syncStop || (DateTime.Now - lastDragTime).TotalSeconds < 1 || !Settled(stopOrder))
+                return;
+            Position p = Positions[execIdx];
+            if (p.MarketPosition == MarketPosition.Flat)
+            {
+                syncStop = stopFallback = false;
+                return;
+            }
+
+            // Price already through the allowed stop: a stop there would be rejected (and the strategy shut down), so exit now
+            bool isLong = p.MarketPosition == MarketPosition.Long;
+            double px = State == State.Realtime ? (isLong ? GetCurrentBid(execIdx) : GetCurrentAsk(execIdx)) : Closes[execIdx][0];
+            if (isLong ? px <= lastSetStop : px >= lastSetStop)
+            {
+                syncStop = stopFallback = false;
+                Log0("Price through allowed stop " + Fmt(lastSetStop) + ", exiting at market");
+                if (isLong) ExitLong(execIdx, p.Quantity, "Stop put-back", activeSignal);
+                else        ExitShort(execIdx, p.Quantity, "Stop put-back", activeSignal);
+                return;
+            }
+
+            if (!stopFallback)
+            {
+                SetStopLoss(activeSignal, CalculationMode.Price, lastSetStop, false);
+                stopFallback = true;   // check again on a later tick, once this change has had time to land
+                return;
+            }
+            // Engine already held this price and left the order alone: put a looser stop back directly
+            if (Math.Abs(stopOrder.StopPrice - lastSetStop) > execTick * 0.5)
+                ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
+            syncStop = stopFallback = false;
+        }
+
+        private static bool Settled(Order o)
+        {
+            return o != null && (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted);
+        }
+
         private void ManageProfitLock()
         {
             if (!UseProfitLock || profitLocked || !tradeOpen)
@@ -732,8 +791,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             double lockPx = Rnd(isLong ? p.AveragePrice + ProfitLockPts : p.AveragePrice - ProfitLockPts);
-            SetStopLoss(activeSignal, CalculationMode.Price, lockPx, false);
             profitLocked = true;
+            // Never loosen a stop that was already tightened by hand past the lock level
+            if (stopKnown && (isLong ? 1 : -1) * (lockPx - lastSetStop) <= execTick * 0.5)
+                return;
+            lastSetStop = lockPx;
+            SetStopLoss(activeSignal, CalculationMode.Price, lockPx, false);
             Log0("Profit lock: stop -> " + Fmt(lockPx));
             RefreshUi();
         }
@@ -741,14 +804,47 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filled,
             double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string nativeError)
         {
-            // TP moved by hand on the chart: stop auto-updating it for this trade
-            if (order.Name == "Profit target" && tradeOpen && !targetManual
-                && (orderState == OrderState.Working || orderState == OrderState.Accepted)
-                && Math.Abs(limitPrice - lastSetTarget) > execTick * 0.5)
+            // Exits dragged on the chart: a tighter stop is kept, a looser one is put back; the TP is kept wherever it is dropped
+            if (tradeOpen && (orderState == OrderState.Working || orderState == OrderState.Accepted))
             {
-                targetManual  = true;
-                lastSetTarget = limitPrice;
-                Log0("TP moved manually -> " + Fmt(limitPrice));
+                int dir = activeSignal == SigLong ? 1 : -1;
+                if (order.Name == "Stop loss")
+                {
+                    stopOrder = order;
+                    double d = dir * (stopPrice - lastSetStop);
+                    if (!stopKnown || d > execTick * 0.5)
+                    {
+                        lastSetStop = stopPrice;
+                        if (stopKnown)
+                        {
+                            // Tell the managed engine right away, or it puts the stop back on the next tick
+                            SetStopLoss(activeSignal, CalculationMode.Price, stopPrice, false);
+                            Log0("SL tightened manually -> " + Fmt(stopPrice));
+                        }
+                        stopKnown = true;
+                    }
+                    else if (d < -execTick * 0.5)
+                    {
+                        Log0("SL can only be tightened, back to " + Fmt(lastSetStop));
+                        lastDragTime = DateTime.Now;
+                        syncStop     = true;
+                        stopFallback = false;
+                    }
+                }
+                else if (order.Name == "Profit target")
+                {
+                    bool matchesOurs = Math.Abs(limitPrice - lastSetTarget) <= execTick * 0.5;
+                    if (matchesOurs)
+                        ownTargetTime = DateTime.MinValue;   // our auto-extend has landed
+                    // Within 3 s of our own auto-extend, an update still at the old target is a stale echo, not a drag
+                    else if ((DateTime.Now - ownTargetTime).TotalSeconds >= 3 || Math.Abs(limitPrice - preExtendTarget) > execTick * 0.5)
+                    {
+                        targetManual = true;
+                        // Tell the managed engine right away, or it puts the TP back on the next tick
+                        SetTarget(activeSignal, limitPrice);
+                        Log0("TP moved manually -> " + Fmt(limitPrice));
+                    }
+                }
             }
 
             if (order.Name != SigLong && order.Name != SigShort)
@@ -777,15 +873,36 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeAnchor  = planAnchor;
                 tradeLeg     = planLeg;
                 targetManual = false;
+                tradeEntry   = price;
+                // Stop was sent as StopLossPts from the fill: know it now, so even the first drag is checked
+                lastSetStop  = Rnd(price - (o.Name == SigLong ? 1 : -1) * StopLossPts);
+                stopKnown     = true;
+                syncStop      = false;
+                stopFallback  = false;
+                stopOrder     = null;
+                ownTargetTime = DateTime.MinValue;
+                // TP was planned from the limit price: re-floor it from the actual fill (only ever further)
+                int fdir = o.Name == SigLong ? 1 : -1;
+                double fillTarget;
+                PickTarget(fdir, price, tradeLeg, out fillTarget);
+                if (fdir * (fillTarget - lastSetTarget) > execTick * 0.5)
+                {
+                    ownTargetTime   = DateTime.Now;
+                    preExtendTarget = lastSetTarget;
+                    SetTarget(activeSignal, fillTarget);
+                    Log0("TP re-set from fill -> " + Fmt(fillTarget));
+                }
                 tradesThisSession++;
                 // Setup is used up: a new one has to form after this trade
                 SideState s = o.Name == SigLong ? longSide : shortSide;
                 s.Reset(false);
                 Log0((o.Name == SigLong ? "LONG" : "SHORT") + " filled @ " + Fmt(price));
             }
-            else if (o.Name == "Stop loss" && o.OrderState == OrderState.Filled)
+            else if ((o.Name == "Stop loss" || o.Name == "Stop put-back") && o.OrderState == OrderState.Filled)
             {
-                if (profitLocked)
+                // A stop at or past entry (profit lock, or tightened by hand) is not a full stop-loss
+                int dir = activeSignal == SigLong ? 1 : -1;
+                if (profitLocked || (stopKnown && dir * (lastSetStop - tradeEntry) >= 0))
                 {
                     Log0("Profit-lock stop hit, setup ended");
                     if (DisarmOnProfitLockStop) Disarm("profit-lock stop");
@@ -845,8 +962,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void Log0(string msg)
         {
             lastEvent = (CurrentBars[0] >= 0 ? Times[0][0].ToString("HH:mm:ss") + " " : "") + msg;
-            if (State == State.Realtime)
-                Print(Name + " " + Instruments[execIdx].FullName + ": " + lastEvent);
+            if (State != State.Realtime)
+                return;
+            string line = Name + " " + Instruments[execIdx].FullName + ": " + lastEvent;
+            Print(line);
+            WriteLogFile(line);
+        }
+
+        // Same lines as the Output window, also kept in Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt
+        // (prefixed with the PC clock) so they survive a restart and can be read without copy-pasting.
+        private static readonly object logFileLock = new object();
+
+        private void WriteLogFile(string line)
+        {
+            try
+            {
+                string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "log",
+                    "EmaRejection." + DateTime.Now.ToString("yyyyMMdd") + ".txt");
+                lock (logFileLock)
+                    System.IO.File.AppendAllText(path, DateTime.Now.ToString("HH:mm:ss.fff") + " " + Account.Name + " " + line + Environment.NewLine);
+            }
+            catch (Exception) { }   // logging must never stop the strategy
         }
 
         private string SideLine(SideState s)
@@ -1083,16 +1219,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 s.Forced     = true;
                 s.ForcedBar  = CurrentBar;
                 // Leg starts at the highest high (short) / lowest low (long) of the lookback, so the target sees the whole move
-                int look = Math.Min(Math.Min(SetupLookbackBars, CurrentBar), 250);
+                // Always the chart series: a custom event can run with the execution series as context
+                int look = Math.Min(Math.Min(SetupLookbackBars, CurrentBars[0]), 250);
                 int best = 0;
                 for (int i = 1; i <= look; i++)
-                    if (s.Dir < 0 ? High[i] > High[best] : Low[i] < Low[best])
+                    if (s.Dir < 0 ? Highs[0][i] > Highs[0][best] : Lows[0][i] < Lows[0][best])
                         best = i;
-                s.ForcedAnchor = CurrentBar - best;
+                s.ForcedAnchor = CurrentBars[0] - best;
                 s.ClosesBeyond = 0;
                 armed = true;
                 Log0((s.Dir > 0 ? "BUY" : "SELL") + " @EMA forced, AUTO ON");
                 ManageEntry(0);
+                if (entryOrder == null && planValid && planTooClose)
+                    Log0((s.Dir > 0 ? "BUY" : "SELL") + " waiting: needs price " + (s.Dir > 0 ? ">= " : "<= ")
+                        + Fmt(planEntry + s.Dir * MinDistFromPricePts) + " (entry " + Fmt(planEntry) + ")");
                 DrawPlan();
                 RefreshUi();
             }, 0, null);
