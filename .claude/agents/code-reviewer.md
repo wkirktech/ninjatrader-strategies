@@ -60,7 +60,7 @@ If a change contradicts this list, report it.
 For docs-only PRs, check only: links, image paths, item 4, and whether the README still matches the code.
 
 ## Verify before reporting
-For every candidate finding, re-read the code path and confirm the failure scenario really happens. Drop anything you can't confirm, or move it to Questions. Never invent findings to look useful. "No issues found" is a valid result.
+For every candidate finding, re-read the code path and confirm the failure scenario really happens. Drop anything you can't confirm, or move it to Questions. Never invent findings to look useful. Any price, log value or line number you quote must come from the code or a log you read. "No issues found" is a valid result.
 
 ## Output
 ```
