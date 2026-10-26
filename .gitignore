@@ -6,6 +6,7 @@
 !/README.md
 !/LICENSE
 !/docs/
+!/tools/
 !/.claude/
 /.claude/*
 !/.claude/agents/
