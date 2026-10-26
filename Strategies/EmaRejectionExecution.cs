@@ -110,7 +110,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double lastSetStop, tradeEntry;
         private bool stopKnown, syncStop, stopFallback;
         private DateTime lastDragTime = DateTime.MinValue;
-        private DateTime ownTargetTime = DateTime.MinValue;   // our own TP change in flight: its echoes aren't manual drags
+        private bool ownTargetPending;   // our own TP change in flight: echoes at the old price aren't manual drags
         private double preExtendTarget;
         private double planEma;
         private string planNote = "";
@@ -640,8 +640,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             PickTarget(dir, p.AveragePrice, tradeLeg, out target);
             if (dir * (target - lastSetTarget) > execTick * 0.5)
             {
-                ownTargetTime   = DateTime.Now;
-                preExtendTarget = lastSetTarget;
+                if (!ownTargetPending)
+                    preExtendTarget = lastSetTarget;   // keep the oldest pending price
+                ownTargetPending = true;
                 SetTarget(activeSignal, target);
                 Log0("TP extended -> " + Fmt(target));
             }
@@ -835,9 +836,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     bool matchesOurs = Math.Abs(limitPrice - lastSetTarget) <= execTick * 0.5;
                     if (matchesOurs)
-                        ownTargetTime = DateTime.MinValue;   // our auto-extend has landed
-                    // Within 3 s of our own auto-extend, an update still at the old target is a stale echo, not a drag
-                    else if ((DateTime.Now - ownTargetTime).TotalSeconds >= 3 || Math.Abs(limitPrice - preExtendTarget) > execTick * 0.5)
+                        ownTargetPending = false;   // our auto-extend has landed
+                    // Until our own change lands, an update between the oldest pending target and ours is a stale echo, not a drag
+                    else if (!ownTargetPending || dir * (limitPrice - preExtendTarget) < -execTick * 0.5
+                                               || dir * (lastSetTarget - limitPrice) < -execTick * 0.5)
                     {
                         targetManual = true;
                         // Tell the managed engine right away, or it puts the TP back on the next tick
@@ -880,14 +882,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 syncStop      = false;
                 stopFallback  = false;
                 stopOrder     = null;
-                ownTargetTime = DateTime.MinValue;
+                ownTargetPending = false;
                 // TP was planned from the limit price: re-floor it from the actual fill (only ever further)
                 int fdir = o.Name == SigLong ? 1 : -1;
                 double fillTarget;
                 PickTarget(fdir, price, tradeLeg, out fillTarget);
                 if (fdir * (fillTarget - lastSetTarget) > execTick * 0.5)
                 {
-                    ownTargetTime   = DateTime.Now;
+                    ownTargetPending = true;
                     preExtendTarget = lastSetTarget;
                     SetTarget(activeSignal, fillTarget);
                     Log0("TP re-set from fill -> " + Fmt(fillTarget));
