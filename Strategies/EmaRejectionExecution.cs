@@ -640,8 +640,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             PickTarget(dir, p.AveragePrice, tradeLeg, out target);
             if (dir * (target - lastSetTarget) > execTick * 0.5)
             {
+                if (!ownTargetPending)
+                    preExtendTarget = lastSetTarget;   // keep the oldest pending price
                 ownTargetPending = true;
-                preExtendTarget = lastSetTarget;
                 SetTarget(activeSignal, target);
                 Log0("TP extended -> " + Fmt(target));
             }
@@ -836,8 +837,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     bool matchesOurs = Math.Abs(limitPrice - lastSetTarget) <= execTick * 0.5;
                     if (matchesOurs)
                         ownTargetPending = false;   // our auto-extend has landed
-                    // Until our own change lands, an update still at the old target is a stale echo, not a drag
-                    else if (!ownTargetPending || Math.Abs(limitPrice - preExtendTarget) > execTick * 0.5)
+                    // Until our own change lands, an update between the oldest pending target and ours is a stale echo, not a drag
+                    else if (!ownTargetPending || dir * (limitPrice - preExtendTarget) < -execTick * 0.5
+                                               || dir * (lastSetTarget - limitPrice) < -execTick * 0.5)
                     {
                         targetManual = true;
                         // Tell the managed engine right away, or it puts the TP back on the next tick
