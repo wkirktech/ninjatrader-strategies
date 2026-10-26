@@ -171,7 +171,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 StopLossPts             = 25;
                 TargetBeyondSwingPts    = 2;
                 MinTargetR              = 1;
-                UseProfitLock           = true;
+                UseProfitLock           = false;
                 ProfitLockTriggerPts    = 30;
                 ProfitLockPts           = 12;
 
@@ -1354,7 +1354,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double MinTargetR { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Use profit lock", Order = 6, GroupName = "3. Exits")]
+        [Display(Name = "Use profit lock", Description = "Off by default. When on, the stop moves to entry +/- Profit lock once price reaches the trigger.", Order = 6, GroupName = "3. Exits")]
         public bool UseProfitLock { get; set; }
 
         [NinjaScriptProperty]
