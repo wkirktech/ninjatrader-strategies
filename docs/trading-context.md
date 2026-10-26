@@ -48,16 +48,24 @@ Size (contracts), entry, stop loss, take profit, grade, exit price, result in R.
 - The eval budget is limited: avoid buying evals until forward tests support the strategy.
 - TradeSpacePro enforces account rules outside NinjaTrader and stays as an independent safety net. The strategy's own limits should trip before it does.
 
-| Rule | Tradeify | Lucid | TradeSpacePro |
-|---|---|---|---|
-| Plan / size | | | |
-| Max drawdown | | | |
-| Trailing: intraday or EOD; stops trailing at | | | |
-| Daily loss limit | | | |
-| Max contracts | | | |
-| Consistency rule | | | |
-| Trading hours / news rules | | | |
-| Max trades per day | | | |
+Account limits. TradeSpacePro (TSP) rows are the user's own limits, set for manual trading; the strategy's limits should sit just inside them. Blank = not confirmed yet.
+
+| Rule | Tradeify 50K | Lucid 25K |
+|---|---|---|
+| Plan | (Select / Growth?) | (Pro / Flex / Daily?) |
+| Max drawdown | $2,000 | $1,000 |
+| Trailing: intraday or EOD; stops trailing at | | |
+| Firm daily loss limit | | |
+| Consistency rule | | |
+| Instruments (TSP) | micros only (MNQ) | micros only (MNQ) |
+| Max contracts (TSP) | 3–4 MNQ | 3–4 MNQ |
+| Max risk per trade (TSP) | $150 | $90 |
+| Daily stop (TSP) | $285 | $150 |
+| Max losses per day (TSP) | 3 | 3 |
+| Max trades per day (TSP) | — | 5 |
+| Trading hours / news rules | | |
+
+What the per-trade caps mean at the default 25-pt stop ($50 per MNQ before costs): Tradeify fits 2 MNQ (3 only with a stop ≤ ~23 pts); Lucid fits 1 MNQ (2 only with a stop ≤ ~21 pts). Grade size is limited by these caps first.
 
 ## Who does what
 - **strategy-analyst:** is the edge real? Builds and grades playbook cards.
