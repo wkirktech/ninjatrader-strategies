@@ -61,8 +61,12 @@ Set-Content -Path $out -Value $reply -Encoding utf8
 
 # The review's lesson goes to lessons.md here, append-only
 if ($Job -eq 'review') {
-    $lesson = ($reply -split "`r?`n") | Where-Object { $_ -match '^LESSON:\s*(\[.+)$' } | Select-Object -Last 1
-    if ($lesson) {
-        Add-Content -Path (Join-Path $analysis 'lessons.md') -Value ($lesson -replace '^LESSON:\s*', '') -Encoding utf8
+    # Tolerates markdown around the label (**LESSON:**, - LESSON:, `LESSON: ...`)
+    $match = ($reply -split "`r?`n") | Select-String -Pattern '^[\s>*`-]*LESSON:[*`]*\s*(\[.+?)`?$' | Select-Object -Last 1
+    if ($match) {
+        Add-Content -Path (Join-Path $analysis 'lessons.md') -Value $match.Matches[0].Groups[1].Value -Encoding utf8
+    }
+    elseif ($reply -match 'LESSON') {
+        Add-Content -Path $out -Value "`n(run-agent: a LESSON line was found but not in the expected format, so nothing was added to lessons.md)" -Encoding utf8
     }
 }
