@@ -760,7 +760,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void SetStops(double price)
         {
             SetStopLoss(activeSignal, CalculationMode.Price, price, false);
-            if (splitActive && !tp1Done)
+            // Always both: a scale-out filled in pieces can still have contracts open after the first TP1 piece fills
+            if (splitActive)
                 SetStopLoss(activeSignal + Tp1Suffix, CalculationMode.Price, price, false);
         }
 
@@ -840,10 +841,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && Math.Abs(entryOrder.LimitPrice - planEntry) > execTick * 0.5)
             {
                 ChangeOrder(entryOrder, entryOrder.Quantity, planEntry, 0);
-                if (Settled(entryOrder1))
-                    ChangeOrder(entryOrder1, entryOrder1.Quantity, planEntry, 0);
                 restingAt = planEntry;
             }
+            // The scale-out limit is kept at the runner's price on its own (it may have been busy when the runner moved)
+            if (Settled(entryOrder1) && Math.Abs(entryOrder1.LimitPrice - restingAt) > execTick * 0.5)
+                ChangeOrder(entryOrder1, entryOrder1.Quantity, restingAt, 0);
 
             SetTarget(entrySignal, planTarget);
             if (splitActive)
@@ -1223,9 +1225,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if ((o.Name == "Stop loss" || o.Name == "Stop put-back") && o.OrderState == OrderState.Filled && !stopHandled)
             {
                 stopHandled = true;   // a split has two stops: count the stop-out once
-                // A stop at or past entry (profit lock, or tightened by hand) is not a full stop-loss
+                // A stop at or past entry (profit lock, tightened by hand) or a runner after TP1 banked is not a full stop-loss
                 int dir = activeSignal == SigLong ? 1 : -1;
-                if (profitLocked || (stopKnown && dir * (lastSetStop - tradeEntry) >= 0))
+                if (profitLocked || tp1Done || (stopKnown && dir * (lastSetStop - tradeEntry) >= 0))
                 {
                     Log0("Profit-lock stop hit, setup ended");
                     if (DisarmOnProfitLockStop) Disarm("profit-lock stop");
@@ -1267,7 +1269,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     exitQty        += quantity;
                     exitValue      += price * quantity;
-                    exitReason      = o.Name;
+                    exitReason      = (tp1Done && !IsTp1Exit(o) ? "TP1+" : "") + o.Name;
                     tradeCloseTime  = time;
                     if (exitQty >= tradeQty)
                         CloseTrade();
