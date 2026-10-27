@@ -105,7 +105,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int vwapStartBar = -1;
         private const int VwapWarmupBars = 10;   // VWAP hugs price right after the 18:00 reset; ignore its crosses there
         private bool inChop, chopRisk;
-        private int chopEmaX, chopVwapX, trendDir;
+        private int chopVwapX, trendDir;
         private double chopEfficiency = 1;
         private string pauseReason = "";
 
@@ -381,16 +381,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             double e = ema[c];
             trendDir = Close[c] > e && Close[c] > lastVwap ? 1 : (Close[c] < e && Close[c] < lastVwap ? -1 : 0);
 
-            // Crosses: closes flipping sides of the EMA / VWAP (both counted together).
+            // Crosses: closes flipping sides of the Globex VWAP. EMA crosses don't count: pullbacks to the EMA are the setup itself.
             // Efficiency: net move / bar-by-bar distance travelled. Trend ~0.5+, chop goes nowhere (~0.2 or less).
-            chopEmaX  = 0;
             chopVwapX = 0;
             double path = 0;
             int look = Math.Min(ChopLookbackBars, CurrentBar - c - 1);
             for (int i = c; i < c + look; i++)
             {
-                if ((Close[i] > ema[i]) != (Close[i + 1] > ema[i + 1]))
-                    chopEmaX++;
                 // VWAP crosses only within this session, after the warm-up (no cross across the reset)
                 if (CurrentBar - (i + 1) >= vwapStartBar + VwapWarmupBars && Values[0].IsValidDataPoint(i + 1) && (Close[i] > Values[0][i]) != (Close[i + 1] > Values[0][i + 1]))
                     chopVwapX++;
@@ -399,7 +396,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             chopEfficiency = path > 0 ? Math.Abs(Close[c] - Close[c + look]) / path : 1;
 
             // Crosses alone = early "risk" heads-up; crosses + low efficiency = CHOP (pauses entries)
-            bool crossesHit = chopEmaX + chopVwapX >= ChopMinCrosses;
+            bool crossesHit = chopVwapX >= ChopMinCrosses;
             bool wasChop = inChop, wasRisk = chopRisk;
             inChop   = crossesHit && chopEfficiency <= ChopMaxEfficiency;
             chopRisk = crossesHit && !inChop;
@@ -1682,7 +1679,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool ShowDashboard { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Pause entries in chop", Description = "Chop = in the lookback, closes crossed the EMA and Globex VWAP at least 'Min crosses' times (both counted together) and efficiency (net move / distance travelled) is at or below 'Chop max efficiency'. No new limits, waiting limit cancelled.", Order = 1, GroupName = "7. Chop / trend")]
+        [Display(Name = "Pause entries in chop", Description = "Chop = in the lookback, closes crossed the Globex VWAP at least 'Min crosses' times (EMA crosses don't count: they are the setup) and efficiency (net move / distance travelled) is at or below 'Chop max efficiency'. No new limits, waiting limit cancelled.", Order = 1, GroupName = "7. Chop / trend")]
         public bool UseChopFilter { get; set; }
 
         [NinjaScriptProperty]
@@ -1692,7 +1689,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, 100)]
-        [Display(Name = "Chop min crosses (EMA + VWAP)", Order = 3, GroupName = "7. Chop / trend")]
+        [Display(Name = "Chop min crosses (VWAP)", Order = 3, GroupName = "7. Chop / trend")]
         public int ChopMinCrosses { get; set; }
 
         [NinjaScriptProperty]
