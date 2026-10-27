@@ -74,6 +74,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string dayStopReason = "", dayBlock = "";
         private int tradeDir, tradeQty, exitQty;
         private double entryValue, exitValue, tradeCommission;
+        private bool costEstimated;   // commission in the journal came from Cost per contract, not the fills
         private double tradeStopInit, tradeTpInit, tradeHigh, tradeLow;
         private DateTime tradeOpenTime, tradeCloseTime;
         private int tradeTrend;
@@ -820,6 +821,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             double entryPx = entryValue / tradeQty;
             double exitPx  = exitValue / exitQty;
             double pts     = tradeDir * (exitPx - entryPx);
+            // Some connections (Tradovate) report no commission on fills: estimate it so P&L and the day limits aren't flattered
+            costEstimated = tradeCommission <= 0 && CostPerContractUsd > 0;
+            if (costEstimated)
+                tradeCommission = CostPerContractUsd * exitQty;
             double pnl     = pts * Instruments[execIdx].MasterInstrument.PointValue * exitQty - tradeCommission;
             dayPnl += pnl;
             if (pnl < 0)
@@ -833,7 +838,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         private const string JournalHeader = "date,open_et,close_et,account,instrument,side,contracts,entry,stop_initial,tp_initial,"
-            + "stop_final,tp_final,exit,points,pnl_usd,commission_usd,r,mae_pts,mfe_pts,exit_reason,trend,chop,forced,grade";
+            + "stop_final,tp_final,exit,points,pnl_usd,commission_usd,r,mae_pts,mfe_pts,exit_reason,trend,chop,forced,grade,cost_estimated";
 
         // One row per trade in Documents\NinjaTrader 8\analysis\trades.csv, for the strategy-analyst and risk-manager
         private void WriteJournal(double entryPx, double exitPx, double pts, double pnl)
@@ -851,7 +856,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Num(entryPx), Num(tradeStopInit), Num(tradeTpInit), Num(lastSetStop), Num(lastSetTarget), Num(exitPx),
                 Num(pts), Num(pnl), Num(tradeCommission), Num(StopLossPts > 0 ? pts / StopLossPts : 0), Num(mae), Num(mfe),
                 exitReason.Replace(",", " "), tradeTrend > 0 ? "bull" : tradeTrend < 0 ? "bear" : "mixed",
-                tradeChop ? "chop" : "", tradeForced ? "forced" : "", ""
+                tradeChop ? "chop" : "", tradeForced ? "forced" : "", "", costEstimated ? "1" : ""
             });
             string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", "trades.csv");
             bool header = !System.IO.File.Exists(path);
@@ -1713,7 +1718,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(0, double.MaxValue)]
-        [Display(Name = "Cost per contract ($, round trip)", Description = "Commission plus expected slippage, added to the stop when checking the daily stop.", Order = 3, GroupName = "8. Day limits")]
+        [Display(Name = "Cost per contract ($, round trip)", Description = "Commission plus expected slippage, added to the stop when checking the daily stop. Also used as the trade's commission in P&L and trades.csv when the connection reports none (cost_estimated = 1).", Order = 3, GroupName = "8. Day limits")]
         public double CostPerContractUsd { get; set; }
         #endregion
     }
