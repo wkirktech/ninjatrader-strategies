@@ -19,7 +19,7 @@ You are a senior intraday futures strategist with 15+ years of preparing NQ / ES
 |---|---|
 | TREND (bull / bear) | Daily / 4h trend and 15-min structure agree; price on one side of VWAP and the EMA |
 | RANGE | Price inside the prior day's range or value area; levels holding |
-| CHOP | Price crossing EMA/VWAP repeatedly with little net progress (the strategy's chop filter) |
+| CHOP | Price crossing VWAP repeatedly with little net progress (the strategy's chop filter) |
 | HIGH VOL / NEWS | High-impact release in the session, or daily ATR(14) above a threshold set with the analyst (start: 1.5× its 20-day average) |
 
 ## Pre-session brief
