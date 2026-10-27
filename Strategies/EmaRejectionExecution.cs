@@ -232,6 +232,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ChopLookbackBars        = 84;
                 ChopMinCrosses          = 5;
                 ChopMaxEfficiency       = 0.25;
+                ChopRecentBars          = 20;
                 TradeWithTrend          = true;
 
                 DailyStopUsd            = 0;
@@ -414,19 +415,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Crosses: closes flipping sides of the Globex VWAP. EMA crosses don't count: pullbacks to the EMA are the setup itself.
             // Efficiency: net move / bar-by-bar distance travelled. Trend ~0.5+, chop goes nowhere (~0.2 or less).
             chopVwapX = 0;
+            int lastCrossAgo = int.MaxValue;   // bars since the newest VWAP cross
             double path = 0;
             int look = Math.Min(ChopLookbackBars, CurrentBar - c - 1);
             for (int i = c; i < c + look; i++)
             {
                 // VWAP crosses only within this session, after the warm-up (no cross across the reset)
                 if (CurrentBar - (i + 1) >= vwapStartBar + VwapWarmupBars && Values[0].IsValidDataPoint(i + 1) && (Close[i] > Values[0][i]) != (Close[i + 1] > Values[0][i + 1]))
+                {
                     chopVwapX++;
+                    lastCrossAgo = Math.Min(lastCrossAgo, i - c);
+                }
                 path += Math.Abs(Close[i] - Close[i + 1]);
             }
             chopEfficiency = path > 0 ? Math.Abs(Close[c] - Close[c + look]) / path : 1;
 
             // Crosses alone = early "risk" heads-up; crosses + low efficiency = CHOP (pauses entries)
-            bool crossesHit = chopVwapX >= ChopMinCrosses;
+            // ...and price is still rotating around VWAP: once it has held one side for ChopRecentBars, old crosses don't count
+            bool crossesHit = chopVwapX >= ChopMinCrosses && (ChopRecentBars <= 0 || lastCrossAgo < ChopRecentBars);
             bool wasChop = inChop, wasRisk = chopRisk;
             inChop   = crossesHit && chopEfficiency <= ChopMaxEfficiency;
             chopRisk = crossesHit && !inChop;
@@ -2000,6 +2006,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0, 1)]
         [Display(Name = "Chop max efficiency", Description = "Net move / bar-by-bar distance over the lookback. Trend ~0.5+, chop ~0.2 or less. Crosses hit + efficiency at or below this = CHOP; crosses hit alone = Chop risk (warning only).", Order = 4, GroupName = "7. Chop / trend")]
         public double ChopMaxEfficiency { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Chop needs a VWAP cross within (bars)", Description = "Chop only while price is still rotating around VWAP: the newest cross must be within this many bars. Once price holds one side of VWAP this long, older crosses no longer count. 0 = off.", Order = 6, GroupName = "7. Chop / trend")]
+        public int ChopRecentBars { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Trade with trend only", Description = "Shorts only when close is below EMA and VWAP (BEARISH), longs only above both (BULLISH). BUY/SELL @EMA buttons bypass this.", Order = 5, GroupName = "7. Chop / trend")]
