@@ -214,8 +214,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ShowDashboard           = true;
 
                 UseChopFilter           = true;
-                ChopLookbackBars        = 120;
-                ChopMinCrosses          = 4;
+                ChopLookbackBars        = 84;
+                ChopMinCrosses          = 5;
                 ChopMaxEfficiency       = 0.25;
                 TradeWithTrend          = true;
 
