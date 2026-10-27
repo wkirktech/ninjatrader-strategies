@@ -149,6 +149,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Order entryOrder1;
         private int runnerOpen, scaleOpen;   // contracts still open per entry signal, so exits name their own entry
         private bool cancelLeftover;
+        private Order leftoverEntry, leftoverEntry1;   // entry orders still open when a trade went flat
         private double lastSetTp1, prevSetTp1;
         private double planEma;
         private string planNote = "";
@@ -333,7 +334,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (cancelLeftover)
                 {
                     cancelLeftover = false;
-                    CancelEntry();
+                    // Only the orders left over from that trade, never a fresh pair sent since
+                    foreach (Order lo in new[] { leftoverEntry, leftoverEntry1 })
+                        if (lo != null && !Order.IsTerminalState(lo.OrderState)
+                            && lo.OrderState != OrderState.CancelPending && lo.OrderState != OrderState.CancelSubmitted)
+                            CancelOrder(lo);
+                    leftoverEntry = leftoverEntry1 = null;
                 }
                 EnforceExitDrags();
                 ManageProfitLock();
@@ -916,17 +922,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetStopLoss(activeSignal + Tp1Suffix, CalculationMode.Price, price, false);
         }
 
-        // Market exit of the whole trade, one order per entry signal (one order for both parts of a split hung NinjaTrader)
+        // Market exit of the whole trade, one order per entry signal (one order across both parts of a split is the likely cause of a NinjaTrader stall)
         private void ExitAll(string name)
         {
             Position p = Positions[execIdx];
             bool isLong = p.MarketPosition == MarketPosition.Long;
             if (runnerOpen <= 0 && scaleOpen <= 0)
             {
-                // Quantities unknown (e.g. a position from before a restart): exit the position as a whole
-                if (isLong) ExitLong(execIdx, p.Quantity, name, "");
-                else        ExitShort(execIdx, p.Quantity, name, "");
-                return;
+                if (!splitActive)
+                {
+                    // Quantities unknown (e.g. a position from before a restart): exit the position as a whole
+                    if (isLong) ExitLong(execIdx, p.Quantity, name, "");
+                    else        ExitShort(execIdx, p.Quantity, name, "");
+                    return;
+                }
+                // Split with unknown counts: still one exit per signal, sized as the entry was split
+                scaleOpen  = Math.Min(p.Quantity, Contracts / 2);
+                runnerOpen = p.Quantity - scaleOpen;
             }
             if (runnerOpen > 0)
             {
@@ -1479,7 +1491,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // A split part that never filled is cancelled on the next update, not inside NinjaTrader's position update
                 if (tradeOpen)
+                {
+                    leftoverEntry  = entryOrder;
+                    leftoverEntry1 = entryOrder1;
                     cancelLeftover = true;
+                }
                 tradeOpen = false;
             }
         }
