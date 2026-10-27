@@ -85,6 +85,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Levels for the market-regime agent: prior Globex session, overnight, and the current session so far
         private double sessHigh, sessLow, sessClose, onHigh, onLow;
         private double priorHigh = double.NaN, priorLow = double.NaN, priorClose = double.NaN;
+        // Trade context for the journal: prior RTH value area, opening range / initial balance, 15-min trend
+        private readonly Dictionary<double, double> rthVolume = new Dictionary<double, double>();
+        private DateTime rthDay = DateTime.MinValue;
+        private bool rthValueDone = true;
+        private double vah, val, poc, orHigh, orLow, ibHigh, ibLow;
+        private int tf15Idx;
+        private EMA ema15;
+        private string ctxSession = "", ctxTf15 = "", ctxValue = "", ctxLevel = "";
+        private double ctxDist;
         private DateTime lastLevelsWrite = DateTime.MinValue;
 
         private double lastSwingHigh, lastSwingLow;
@@ -256,10 +265,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     AddDataSeries(exec);
                     execIdx = 1;
                 }
+                // 15-min bars of the chart instrument: higher-timeframe trend for the trade journal
+                AddDataSeries(BarsPeriodType.Minute, 15);
+                tf15Idx = execIdx + 1;
             }
             else if (State == State.DataLoaded)
             {
                 ema = EMA(Closes[0], EmaPeriod);
+                ema15 = EMA(Closes[tf15Idx], 12);
                 if (ShowEma)
                     AddChartIndicator(ema);
 
@@ -382,6 +395,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 onHigh = Math.Max(onHigh, High[c]);
                 onLow  = Math.Min(onLow, Low[c]);
             }
+            UpdateRthProfile(et, c);
 
             double vol = Volume[c];
             if (vol > 0)
@@ -421,6 +435,123 @@ namespace NinjaTrader.NinjaScript.Strategies
             WriteLevels(et, ema[c]);
         }
 
+        // RTH (09:30-16:00 ET): volume by 1-pt price bin for the value area, opening range (first 15 min), initial balance (first hour).
+        // The value area is computed once RTH has closed, so during a session it is always the prior RTH day's.
+        private void UpdateRthProfile(DateTime et, int c)
+        {
+            TimeSpan tod = et.TimeOfDay;
+            if (tod >= new TimeSpan(9, 30, 0) && tod < new TimeSpan(16, 0, 0))
+            {
+                if (et.Date != rthDay)
+                {
+                    rthDay = et.Date;
+                    rthVolume.Clear();
+                    rthValueDone = false;
+                    orHigh = ibHigh = double.MinValue;
+                    orLow  = ibLow  = double.MaxValue;
+                }
+                double bin = Math.Round(Close[c]);
+                double v;
+                rthVolume.TryGetValue(bin, out v);
+                rthVolume[bin] = v + Volume[c];
+                if (tod < new TimeSpan(9, 45, 0))
+                {
+                    orHigh = Math.Max(orHigh, High[c]);
+                    orLow  = Math.Min(orLow, Low[c]);
+                }
+                if (tod < new TimeSpan(10, 30, 0))
+                {
+                    ibHigh = Math.Max(ibHigh, High[c]);
+                    ibLow  = Math.Min(ibLow, Low[c]);
+                }
+            }
+            else if (!rthValueDone && rthVolume.Count > 0)
+            {
+                rthValueDone = true;
+                ComputeValueArea();
+            }
+        }
+
+        // POC = busiest bin; the value area grows from it, taking the busier neighbour each step, until it holds 70% of the volume
+        private void ComputeValueArea()
+        {
+            List<double> bins = new List<double>(rthVolume.Keys);
+            bins.Sort();
+            double total = 0;
+            int p = 0;
+            for (int i = 0; i < bins.Count; i++)
+            {
+                total += rthVolume[bins[i]];
+                if (rthVolume[bins[i]] > rthVolume[bins[p]])
+                    p = i;
+            }
+            int lo = p, hi = p;
+            double inside = rthVolume[bins[p]];
+            while (inside < total * 0.7 && (lo > 0 || hi < bins.Count - 1))
+            {
+                double below = lo > 0 ? rthVolume[bins[lo - 1]] : -1;
+                double above = hi < bins.Count - 1 ? rthVolume[bins[hi + 1]] : -1;
+                if (above >= below)
+                    inside += rthVolume[bins[++hi]];
+                else
+                    inside += rthVolume[bins[--lo]];
+            }
+            poc = bins[p];
+            vah = bins[hi];
+            val = bins[lo];
+        }
+
+        // Where the trade started, from data known at the fill (no look-ahead)
+        private void SnapshotContext(double price, DateTime time)
+        {
+            DateTime et = ToEt(time);
+            TimeSpan tod = et.TimeOfDay;
+            ctxSession = tod >= new TimeSpan(18, 0, 0) || tod < new TimeSpan(3, 0, 0) ? "asia"
+                : tod < new TimeSpan(9, 30, 0) ? "london"
+                : tod < new TimeSpan(10, 30, 0) ? "rth_open"
+                : tod < new TimeSpan(14, 0, 0) ? "midday"
+                : tod < new TimeSpan(16, 0, 0) ? "close" : "post";
+
+            // Last closed 15-min bar vs its EMA 12
+            ctxTf15 = CurrentBars[tf15Idx] > 13
+                ? (Closes[tf15Idx][1] > ema15[1] ? "up" : Closes[tf15Idx][1] < ema15[1] ? "down" : "flat") : "";
+
+            ctxValue = vah > 0 ? (price > vah ? "above" : price < val ? "below" : "inside") : "";
+
+            // Nearest key level; opening range / IB only once complete today
+            bool today = et.Date == rthDay;
+            List<KeyValuePair<string, double>> levels = new List<KeyValuePair<string, double>>
+            {
+                new KeyValuePair<string, double>("prior_high", priorHigh), new KeyValuePair<string, double>("prior_low", priorLow),
+                new KeyValuePair<string, double>("prior_close", priorClose), new KeyValuePair<string, double>("on_high", onHigh),
+                new KeyValuePair<string, double>("on_low", onLow), new KeyValuePair<string, double>("vwap", lastVwap),
+                new KeyValuePair<string, double>("vah", vah), new KeyValuePair<string, double>("val", val),
+                new KeyValuePair<string, double>("poc", poc)
+            };
+            if (today && tod >= new TimeSpan(9, 45, 0))
+            {
+                levels.Add(new KeyValuePair<string, double>("or_high", orHigh));
+                levels.Add(new KeyValuePair<string, double>("or_low", orLow));
+            }
+            if (today && tod >= new TimeSpan(10, 30, 0))
+            {
+                levels.Add(new KeyValuePair<string, double>("ib_high", ibHigh));
+                levels.Add(new KeyValuePair<string, double>("ib_low", ibLow));
+            }
+            ctxLevel = "";
+            ctxDist  = 0;
+            foreach (KeyValuePair<string, double> l in levels)
+            {
+                if (double.IsNaN(l.Value) || l.Value <= 0 || l.Value == double.MaxValue)
+                    continue;
+                if (ctxLevel.Length == 0 || Math.Abs(price - l.Value) < Math.Abs(ctxDist))
+                {
+                    ctxLevel = l.Key;
+                    ctxDist  = price - l.Value;
+                }
+            }
+        }
+
         // Current levels for the market-regime agent: Documents\NinjaTrader 8\analysis\levels.txt, rewritten about once a minute
         private void WriteLevels(DateTime et, double e)
         {
@@ -431,6 +562,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + "prior session   H " + Lvl(priorHigh) + "  L " + Lvl(priorLow) + "  C " + Lvl(priorClose) + Environment.NewLine
                 + "overnight       H " + Lvl(onHigh) + "  L " + Lvl(onLow) + Environment.NewLine
                 + "session so far  H " + Lvl(sessHigh) + "  L " + Lvl(sessLow) + "  last " + Lvl(sessClose) + Environment.NewLine
+                + "prior RTH value VAH " + Lvl(vah) + "  POC " + Lvl(poc) + "  VAL " + Lvl(val) + Environment.NewLine
+                + "opening range   H " + Lvl(orHigh) + "  L " + Lvl(orLow) + "   initial balance H " + Lvl(ibHigh) + "  L " + Lvl(ibLow) + Environment.NewLine
                 + "VWAP " + Lvl(lastVwap) + "  EMA" + EmaPeriod + " " + Lvl(e) + Environment.NewLine
                 + "trend " + (trendDir > 0 ? "BULLISH" : trendDir < 0 ? "BEARISH" : "MIXED")
                 + "  chop " + (inChop ? "CHOP" : chopRisk ? "risk" : "none") + "  efficiency " + chopEfficiency.ToString("0.00") + Environment.NewLine;
@@ -439,7 +572,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private string Lvl(double x)
         {
-            return double.IsNaN(x) || x <= 0 || x == double.MaxValue ? "-" : Fmt(x);
+            return double.IsNaN(x) || x <= 0 || x == double.MaxValue || x == double.MinValue ? "-" : Fmt(x);
         }
 
         private string StatusText()
@@ -904,7 +1037,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         private const string JournalHeader = "date,open_et,close_et,account,instrument,side,contracts,entry,stop_initial,tp_initial,"
-            + "stop_final,tp_final,exit,points,pnl_usd,commission_usd,r,mae_pts,mfe_pts,exit_reason,trend,chop,forced,grade,cost_estimated";
+            + "stop_final,tp_final,exit,points,pnl_usd,commission_usd,r,mae_pts,mfe_pts,exit_reason,trend,chop,forced,grade,cost_estimated,"
+            + "session,tf15_trend,value_loc,nearest_level,level_dist_pts";
 
         // One row per trade in Documents\NinjaTrader 8\analysis\trades.csv, for the strategy-analyst and risk-manager
         private void WriteJournal(double entryPx, double exitPx, double pts, double pnl)
@@ -922,7 +1056,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Num(entryPx), Num(tradeStopInit), Num(tradeTpInit), Num(lastSetStop), Num(lastSetTarget), Num(exitPx),
                 Num(pts), Num(pnl), Num(tradeCommission), Num(StopLossPts > 0 ? pts / StopLossPts : 0), Num(mae), Num(mfe),
                 exitReason.Replace(",", " "), tradeTrend > 0 ? "bull" : tradeTrend < 0 ? "bear" : "mixed",
-                tradeChop ? "chop" : "", tradeForced ? "forced" : "", "", costEstimated ? "1" : ""
+                tradeChop ? "chop" : "", tradeForced ? "forced" : "", "", costEstimated ? "1" : "",
+                ctxSession, ctxTf15, ctxValue, ctxLevel, ctxLevel.Length > 0 ? Num(ctxDist) : ""
             });
             string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", "trades.csv");
             bool header = !System.IO.File.Exists(path);
@@ -1215,6 +1350,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeTpInit     = lastSetTarget;
                 tradeTrend      = trendDir;
                 tradeChop       = inChop;
+                SnapshotContext(price, time);
                 exitReason      = "";
                 // Setup is used up: a new one has to form after this trade
                 SideState s = activeSignal == SigLong ? longSide : shortSide;
