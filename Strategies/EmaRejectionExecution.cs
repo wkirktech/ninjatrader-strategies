@@ -68,6 +68,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int lastProcessedBar = -1;
         private int tradesThisSession;
 
+        // Day limits (reset with tradesThisSession) and the trade being journaled
+        private double dayPnl;
+        private int dayLosses;
+        private string dayStopReason = "", dayBlock = "";
+        private int tradeDir, tradeQty, exitQty;
+        private double entryValue, exitValue, tradeCommission;
+        private double tradeStopInit, tradeTpInit, tradeHigh, tradeLow;
+        private DateTime tradeOpenTime, tradeCloseTime;
+        private int tradeTrend;
+        private bool tradeChop, tradeForced;
+        private string exitReason = "";
+
+        // Levels for the market-regime agent: prior Globex session, overnight, and the current session so far
+        private double sessHigh, sessLow, sessClose, onHigh, onLow;
+        private double priorHigh = double.NaN, priorLow = double.NaN, priorClose = double.NaN;
+        private DateTime lastLevelsWrite = DateTime.MinValue;
+
         private double lastSwingHigh, lastSwingLow;
         private bool hasSwingHigh, hasSwingLow;
         private int lastSwingHighBar = -1, lastSwingLowBar = -1;
@@ -198,6 +215,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ChopMaxEfficiency       = 0.25;
                 TradeWithTrend          = true;
 
+                DailyStopUsd            = 0;
+                MaxLossesPerDay         = 3;
+                CostPerContractUsd      = 2.5;
+
                 AddPlot(Brushes.Orange, "VWAP");
             }
             else if (State == State.Configure)
@@ -275,6 +296,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 EnforceExitDrags();
                 ManageProfitLock();
+                if (tradeOpen)
+                {
+                    tradeHigh = Math.Max(tradeHigh, Closes[execIdx][0]);
+                    tradeLow  = Math.Min(tradeLow, Closes[execIdx][0]);
+                }
             }
 
             if (BarsInProgress != 0 || !IsFirstTickOfBar)
@@ -289,7 +315,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastProcessedBar = cb;
 
             if (Bars.IsFirstBarOfSession)
+            {
                 tradesThisSession = 0;
+                dayPnl        = 0;
+                dayLosses     = 0;
+                dayStopReason = "";
+            }
 
             UpdateSwings(c);
             UpdateVwapAndChop(c);
@@ -309,11 +340,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             DateTime session = et.AddHours(6).Date;
             if (session != vwapSession)
             {
+                if (vwapSession != DateTime.MinValue)
+                {
+                    priorHigh  = sessHigh;
+                    priorLow   = sessLow;
+                    priorClose = sessClose;
+                    Log0("Session start: prior H " + Fmt(priorHigh) + " L " + Fmt(priorLow) + " C " + Fmt(priorClose));
+                }
+                sessHigh = onHigh = double.MinValue;
+                sessLow  = onLow  = double.MaxValue;
                 vwapSession  = session;
                 vwapStartBar = CurrentBar - c;
                 vwapPV  = 0;
                 vwapVol = 0;
             }
+            sessHigh  = Math.Max(sessHigh, High[c]);
+            sessLow   = Math.Min(sessLow, Low[c]);
+            sessClose = Close[c];
+            if (et.TimeOfDay < new TimeSpan(9, 30, 0) || et.TimeOfDay >= new TimeSpan(18, 0, 0))
+            {
+                onHigh = Math.Max(onHigh, High[c]);
+                onLow  = Math.Min(onLow, Low[c]);
+            }
+
             double vol = Volume[c];
             if (vol > 0)
             {
@@ -352,6 +401,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             chopRisk = crossesHit && !inChop;
             if (inChop != wasChop || chopRisk != wasRisk)
                 Log0(inChop ? "CHOP detected" + (UseChopFilter ? ", entries paused" : "") : chopRisk ? "Chop risk" : "Chop cleared");
+            WriteLevels(et, ema[c]);
+        }
+
+        // Current levels for the market-regime agent: Documents\NinjaTrader 8\analysis\levels.txt, rewritten about once a minute
+        private void WriteLevels(DateTime et, double e)
+        {
+            if (State != State.Realtime || (DateTime.Now - lastLevelsWrite).TotalSeconds < 60)
+                return;
+            lastLevelsWrite = DateTime.Now;
+            string text = "updated " + et.ToString("yyyy-MM-dd HH:mm") + " ET  " + Instrument.FullName + Environment.NewLine
+                + "prior session   H " + Lvl(priorHigh) + "  L " + Lvl(priorLow) + "  C " + Lvl(priorClose) + Environment.NewLine
+                + "overnight       H " + Lvl(onHigh) + "  L " + Lvl(onLow) + Environment.NewLine
+                + "session so far  H " + Lvl(sessHigh) + "  L " + Lvl(sessLow) + "  last " + Lvl(sessClose) + Environment.NewLine
+                + "VWAP " + Lvl(lastVwap) + "  EMA" + EmaPeriod + " " + Lvl(e) + Environment.NewLine
+                + "trend " + (trendDir > 0 ? "BULLISH" : trendDir < 0 ? "BEARISH" : "MIXED")
+                + "  chop " + (inChop ? "CHOP" : chopRisk ? "risk" : "none") + "  efficiency " + chopEfficiency.ToString("0.00") + Environment.NewLine;
+            WriteAnalysisFile("levels.txt", text, false);
+        }
+
+        private string Lvl(double x)
+        {
+            return double.IsNaN(x) || x <= 0 || x == double.MaxValue ? "-" : Fmt(x);
         }
 
         private string StatusText()
@@ -666,8 +737,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             SideState s = PickSide(c);
             planValid = s != null && BuildPlan(s, c);
 
-            bool allowed = planValid && pauseReason.Length == 0 && armed && CanTradeNow() && InSession(c)
-                && (MaxTradesPerSession <= 0 || tradesThisSession < MaxTradesPerSession);
+            string block = DayBlockReason();
+            if (block != dayBlock && block.Length > 0 && planValid && armed && CanTradeNow())
+                Log0("Entries blocked: " + block);
+            dayBlock = block;
+
+            bool allowed = planValid && pauseReason.Length == 0 && dayBlock.Length == 0 && armed && CanTradeNow() && InSession(c);
             if (!allowed)
             {
                 CancelEntry();
@@ -707,6 +782,94 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ChangeOrder(entryOrder, entryOrder.Quantity, planEntry, 0);
 
             SetTarget(entrySignal, planTarget);
+        }
+
+        // Day limits: "" = new entries allowed. A trade is only taken if its full stop keeps the day inside the daily stop.
+        private string DayBlockReason()
+        {
+            if (dayStopReason.Length > 0)
+                return dayStopReason;
+            if (MaxTradesPerSession > 0 && tradesThisSession >= MaxTradesPerSession)
+                return "max trades";
+            double risk = (StopLossPts * Instruments[execIdx].MasterInstrument.PointValue + CostPerContractUsd) * Contracts;
+            if (DailyStopUsd > 0 && dayPnl - risk < -DailyStopUsd)
+                return "daily stop: a full stop (" + Usd(-risk) + ") would pass it";
+            return "";
+        }
+
+        private void CheckDayLimits()
+        {
+            if (dayStopReason.Length > 0)
+                return;
+            if (DailyStopUsd > 0 && dayPnl <= -DailyStopUsd)
+                dayStopReason = "daily stop";
+            else if (MaxLossesPerDay > 0 && dayLosses >= MaxLossesPerDay)
+                dayStopReason = "max losses";
+            else
+                return;
+            Log0("Day limit hit (" + dayStopReason + "): day " + Usd(dayPnl) + ", losses " + dayLosses);
+            Disarm(dayStopReason);
+        }
+
+        // All contracts are out: book the trade once for the day limits and the journal
+        private void CloseTrade()
+        {
+            if (tradeQty <= 0 || exitQty <= 0)
+                return;
+            double entryPx = entryValue / tradeQty;
+            double exitPx  = exitValue / exitQty;
+            double pts     = tradeDir * (exitPx - entryPx);
+            double pnl     = pts * Instruments[execIdx].MasterInstrument.PointValue * exitQty - tradeCommission;
+            dayPnl += pnl;
+            if (pnl < 0)
+                dayLosses++;
+            Log0("Trade closed " + Usd(pnl) + " (" + pts.ToString("0.##") + " pts), day " + Usd(dayPnl));
+            CheckDayLimits();   // before the file write, so a slow or locked file can't delay AUTO OFF
+            WriteJournal(entryPx, exitPx, pts, pnl);
+            // Booked: a late entry partial after this starts a fresh tally
+            tradeQty   = exitQty = 0;
+            entryValue = exitValue = tradeCommission = 0;
+        }
+
+        private const string JournalHeader = "date,open_et,close_et,account,instrument,side,contracts,entry,stop_initial,tp_initial,"
+            + "stop_final,tp_final,exit,points,pnl_usd,commission_usd,r,mae_pts,mfe_pts,exit_reason,trend,chop,forced,grade";
+
+        // One row per trade in Documents\NinjaTrader 8\analysis\trades.csv, for the strategy-analyst and risk-manager
+        private void WriteJournal(double entryPx, double exitPx, double pts, double pnl)
+        {
+            if (State != State.Realtime)
+                return;
+            DateTime openEt  = ToEt(tradeOpenTime);
+            DateTime closeEt = ToEt(tradeCloseTime);
+            double mae = Math.Max(0, tradeDir > 0 ? entryPx - tradeLow : tradeHigh - entryPx);
+            double mfe = Math.Max(0, tradeDir > 0 ? tradeHigh - entryPx : entryPx - tradeLow);
+            string row = string.Join(",", new[]
+            {
+                openEt.AddHours(6).ToString("yyyy-MM-dd"), openEt.ToString("HH:mm:ss"), closeEt.ToString("HH:mm:ss"),
+                Account.Name, Instruments[execIdx].FullName, tradeDir > 0 ? "long" : "short", exitQty.ToString(),
+                Num(entryPx), Num(tradeStopInit), Num(tradeTpInit), Num(lastSetStop), Num(lastSetTarget), Num(exitPx),
+                Num(pts), Num(pnl), Num(tradeCommission), Num(StopLossPts > 0 ? pts / StopLossPts : 0), Num(mae), Num(mfe),
+                exitReason.Replace(",", " "), tradeTrend > 0 ? "bull" : tradeTrend < 0 ? "bear" : "mixed",
+                tradeChop ? "chop" : "", tradeForced ? "forced" : "", ""
+            });
+            string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", "trades.csv");
+            bool header = !System.IO.File.Exists(path);
+            WriteAnalysisFile("trades.csv", (header ? JournalHeader + Environment.NewLine : "") + row + Environment.NewLine, true);
+        }
+
+        private DateTime ToEt(DateTime t)
+        {
+            return TimeZoneInfo.ConvertTime(t, NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo, easternTz);
+        }
+
+        private static string Num(double x)
+        {
+            return x.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static string Usd(double x)
+        {
+            return (x < 0 ? "-$" : "$") + Math.Abs(x).ToString("0");
         }
 
         private void SubmitEntry(SideState s, int cb)
@@ -895,8 +1058,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Log0("TP re-set from fill -> " + Fmt(fillTarget));
                 }
                 tradesThisSession++;
+                // Journal: what the trade started with
+                tradeDir        = fdir;
+                tradeQty        = exitQty = 0;
+                entryValue      = exitValue = tradeCommission = 0;
+                tradeHigh       = tradeLow = price;
+                tradeOpenTime   = time;
+                tradeStopInit   = lastSetStop;
+                tradeTpInit     = lastSetTarget;
+                tradeTrend      = trendDir;
+                tradeChop       = inChop;
+                exitReason      = "";
                 // Setup is used up: a new one has to form after this trade
                 SideState s = o.Name == SigLong ? longSide : shortSide;
+                tradeForced = s.Forced;
                 s.Reset(false);
                 Log0((o.Name == SigLong ? "LONG" : "SHORT") + " filled @ " + Fmt(price));
             }
@@ -917,6 +1092,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (o.Name == "Profit target" && o.OrderState == OrderState.Filled)
                 Log0("TARGET hit @ " + Fmt(price));
+
+            // Every fill of the open trade (partials included), for the journal and the day P&L.
+            // tradeQty > 0 keeps exits counted even if the Flat position update arrives before the last exit fill.
+            if ((tradeOpen || tradeQty > 0) && execution.Instrument == Instruments[execIdx])
+            {
+                tradeCommission += execution.Commission;
+                if (o.Name == SigLong || o.Name == SigShort)
+                {
+                    tradeQty   += quantity;
+                    entryValue += price * quantity;
+                }
+                else
+                {
+                    exitQty        += quantity;
+                    exitValue      += price * quantity;
+                    exitReason      = o.Name;
+                    tradeCloseTime  = time;
+                    if (exitQty >= tradeQty)
+                        CloseTrade();
+                }
+            }
 
             RefreshUi();
         }
@@ -987,6 +1183,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception) { }   // logging must never stop the strategy
         }
 
+        // Files for the agents in Documents\NinjaTrader 8\analysis\ (outside the repo)
+        private void WriteAnalysisFile(string name, string text, bool append)
+        {
+            try
+            {
+                string dir = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis");
+                System.IO.Directory.CreateDirectory(dir);
+                string path = System.IO.Path.Combine(dir, name);
+                lock (logFileLock)
+                {
+                    if (append)
+                        System.IO.File.AppendAllText(path, text);
+                    else
+                        System.IO.File.WriteAllText(path, text);
+                }
+            }
+            catch (Exception ex) { Print(Name + ": could not write analysis\\" + name + " (" + ex.Message + ")"); }   // never stop the strategy
+        }
+
         private string SideLine(SideState s)
         {
             string label = s.Dir < 0 ? "SHORT rej " : "LONG bnc  ";
@@ -1030,14 +1245,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 t += "  SL " + Fmt(planStop) + "  TP " + Fmt(planTarget)
                     + (planFallback ? " (min " + (StopLossPts * MinTargetR).ToString("0.##") +(double.IsNaN(planLeg) ? ", no leg)" : ", " + legName + Fmt(planLeg) + " too close)") : " (" + legName + Fmt(planLeg) + ")")
                     + "  " + (risk > 0 ? (reward / risk).ToString("0.00") : "-") + "R\n";
-                string waitWhy = pauseReason.Length > 0 ? "PAUSED (" + pauseReason + ")" : planTooClose ?"waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
+                string waitWhy = dayBlock.Length > 0 ? "DAY LIMIT (" + dayBlock + ")" : pauseReason.Length > 0 ? "PAUSED (" + pauseReason + ")" : planTooClose ?"waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
                 t += "Order: " + (entryOrder != null ? entryOrder.OrderState + " @ " + Fmt(entryOrder.LimitPrice) + (planTooClose ? " (held, price close)" : "")
                     : (armed ? (CanTradeNow() ? waitWhy : "live only") : "AUTO is OFF")) + "\n";
             }
             else
                 t += "Plan: none" + (planNote.Length > 0 ? " (" + planNote + ")" : "") + "\n";
 
-            t += "Trades " + tradesThisSession + (MaxTradesPerSession > 0 ? "/" + MaxTradesPerSession : "")
+            t += "Day " + Usd(dayPnl) + (DailyStopUsd > 0 ? " / -$" + DailyStopUsd.ToString("0") : "")
+                + "  Losses " + dayLosses + (MaxLossesPerDay > 0 ? "/" + MaxLossesPerDay : "")
+                + "  Trades " + tradesThisSession + (MaxTradesPerSession > 0 ? "/" + MaxTradesPerSession : "")
                 + "  on " + Instruments[execIdx].FullName + "\n";
             t += lastEvent;
             return t;
@@ -1232,7 +1449,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 armed = true;
                 Log0((s.Dir > 0 ? "BUY" : "SELL") + " @EMA forced, AUTO ON");
                 ManageEntry(0);
-                if (entryOrder == null && planValid && planTooClose)
+                if (dayBlock.Length > 0)
+                    Log0((s.Dir > 0 ? "BUY" : "SELL") + " blocked: " + dayBlock);
+                else if (entryOrder == null && planValid && planTooClose)
                     Log0((s.Dir > 0 ? "BUY" : "SELL") + " waiting: needs price " + (s.Dir > 0 ? ">= " : "<= ")
                         + Fmt(planEntry + s.Dir * MinDistFromPricePts) + " (entry " + Fmt(planEntry) + ")");
                 DrawPlan();
@@ -1445,6 +1664,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Trade with trend only", Description = "Shorts only when close is below EMA and VWAP (BEARISH), longs only above both (BULLISH). BUY/SELL @EMA buttons bypass this.", Order = 5, GroupName = "7. Chop / trend")]
         public bool TradeWithTrend { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Daily stop ($, 0 = off)", Description = "No new entry if a full stop on the next trade (plus costs) would take the day's closed P&L below -this. Set just inside the account's own daily limit (e.g. TradeSpacePro). Resets at the chart's session start, so use an ETH (18:00 ET) trading-hours template; with Max trades per session, these are the day limits.", Order = 1, GroupName = "8. Day limits")]
+        public double DailyStopUsd { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Max losing trades per day (0 = off)", Description = "A trade counts as a loss when its net P&L (after commission) is below 0, so a breakeven scratch counts.", Order = 2, GroupName = "8. Day limits")]
+        public int MaxLossesPerDay { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Cost per contract ($, round trip)", Description = "Commission plus expected slippage, added to the stop when checking the daily stop.", Order = 3, GroupName = "8. Day limits")]
+        public double CostPerContractUsd { get; set; }
         #endregion
     }
 }

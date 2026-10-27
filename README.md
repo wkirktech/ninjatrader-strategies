@@ -39,6 +39,7 @@ Built for NQ / MNQ index futures on fast execution charts (377-tick, 1-min, 3-mi
 | **Target** | The setup's lower low (short) / higher high (long) plus a buffer, never closer than a minimum R-multiple (default 1:1). It extends with the leg until you drag it; wherever you drop it, it stays. |
 | **Profit lock** | Off by default. When on, at +30 pts the stop moves to +12 pts (both configurable). |
 | **Automation** | Stays armed and takes every new setup until a full stop-loss hit (configurable), or until you switch it off. |
+| **Day limits** | Optional daily stop ($), max losing trades and max trades. A trade is only taken if its full stop keeps the day inside the daily stop; once a limit is hit, AUTO turns off for the day. |
 
 ### Dashboard
 
@@ -56,7 +57,7 @@ The buttons are:
 - **FLAT+OFF**: cancels the order, closes the position and turns AUTO off
 - **BUY @EMA / SELL @EMA**: forces a setup on that side
 
-Every event (orders, fills, drags, chop, auto on/off) is also written to `Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt`, so a session can be reviewed after a restart.
+Every event (orders, fills, drags, chop, auto on/off) is also written to `Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt`, so a session can be reviewed after a restart. Each closed trade is added to `Documents\NinjaTrader 8\analysis\trades.csv` (size, entry, stop, target, exit, P&L, R, MAE/MFE), and `analysis\levels.txt` holds the current levels (prior session, overnight, VWAP, trend, chop) for the agents.
 
 ### Design notes
 
