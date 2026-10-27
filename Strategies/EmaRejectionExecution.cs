@@ -162,6 +162,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool entryCancelRequested;   // our own CancelEntry; any other cancel of an entry came from outside
         private string accountBlock = "";
         private bool entryIgnoredLogged;
+        private DateTime realtimeSince = DateTime.MaxValue, lastFillWall = DateTime.MinValue;
 
         private class ClosedTrade
         {
@@ -313,8 +314,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     chartControlRef.Dispatcher.InvokeAsync(new Action(BuildUi));
                 }
             }
+            else if (State == State.Realtime)
+                realtimeSince = DateTime.Now;
             else if (State == State.Terminated)
             {
+                // Trades booked in a fill callback but not yet applied still reach the journal
+                foreach (ClosedTrade ct in pendingCloses)
+                    if (ct.Row != null)
+                        QueueFile(new FileWrite { Path = AnalysisPath("trades.csv"), Text = ct.Row + Environment.NewLine, Append = true, Header = JournalHeader });
+                pendingCloses.Clear();
                 if (chartControlRef != null)
                     chartControlRef.Dispatcher.InvokeAsync(new Action(RemoveUi));
             }
@@ -346,9 +354,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (execIdx > 0 && CurrentBars[execIdx] < 1)
                 return;
 
+            // Before anything that can send an entry or reset the day (on either series): AUTO OFF and the day limits from
+            // a fill must take effect first
+            ProcessPending();
+
             if (BarsInProgress == execIdx)
             {
-                ProcessPending();
                 EnforceExitDrags();
                 ManageProfitLock();
                 if (tradeOpen)
@@ -509,18 +520,29 @@ namespace NinjaTrader.NinjaScript.Strategies
         // block it ends, so the time is nudged back a tick before bucketing.
         private void Update15MinTrend(DateTime et, double close)
         {
-            long bucket = et.AddTicks(-1).Ticks / TimeSpan.FromMinutes(15).Ticks;
+            long span   = TimeSpan.FromMinutes(15).Ticks;
+            long bucket = et.AddTicks(-1).Ticks / span;
             if (bucket != m15Bucket)
             {
                 if (m15Bucket >= 0)
-                {
-                    m15Closed = m15LastClose;
-                    m15Ema    = m15Count == 0 ? m15Closed : m15Ema + 2.0 / 13 * (m15Closed - m15Ema);
-                    m15Count++;
-                }
+                    Close15Min();
                 m15Bucket = bucket;
             }
             m15LastClose = close;
+            // Minute / second bars ending exactly on a 15-min mark close the block now, not when the next block starts
+            bool timeBars = BarsPeriod.BarsPeriodType == BarsPeriodType.Minute || BarsPeriod.BarsPeriodType == BarsPeriodType.Second;
+            if (timeBars && et.Ticks % span == 0)
+            {
+                Close15Min();
+                m15Bucket = -2;   // closed: the next bar starts a new block without closing this one again
+            }
+        }
+
+        private void Close15Min()
+        {
+            m15Closed = m15LastClose;
+            m15Ema    = m15Count == 0 ? m15Closed : m15Ema + 2.0 / 13 * (m15Closed - m15Ema);
+            m15Count++;
         }
 
         // POC = busiest bin; the value area grows from it, taking the busier neighbour each step, until it holds 70% of the volume
@@ -1012,7 +1034,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             dayBlock = block;
 
             // A position on this account the strategy didn't open (manual / ATM) would mix with ours: no entries until it's flat
-            string acct = CanTradeNow() && State == State.Realtime && PositionsAccount[execIdx].MarketPosition != MarketPosition.Flat
+            // The broker's account position can lag our own fills by a moment, so it is only judged once fills have been quiet
+            string acct = CanTradeNow() && State == State.Realtime && (DateTime.Now - lastFillWall).TotalSeconds > 3
+                && PositionsAccount[execIdx].MarketPosition != MarketPosition.Flat
                 ? "account has a position the strategy doesn't own (" + PositionsAccount[execIdx].MarketPosition + " "
                   + PositionsAccount[execIdx].Quantity + ")" : "";
             if (acct != accountBlock && acct.Length > 0 && planValid && armed)
@@ -1116,6 +1140,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (costEstimated)
                 tradeCommission = CostPerContractUsd * exitQty;
             double pnl = pts * Instruments[execIdx].MasterInstrument.PointValue * exitQty - tradeCommission;
+            if (fillPending)
+                SnapshotContext(fillPrice, fillTime);   // opened and closed before the next update: context for the row (pure math)
             pendingCloses.Add(new ClosedTrade
             {
                 Pnl     = pnl,
@@ -1177,8 +1203,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 PickTarget(fdir, fillPrice, tradeLeg, out fillTarget);
                 if (tradeOpen && !targetManual && fdir * (fillTarget - lastSetTarget) > execTick * 0.5)
                 {
+                    if (!ownTargetPending)
+                        preExtendTarget = lastSetTarget;   // keep the oldest pending price
                     ownTargetPending = true;
-                    preExtendTarget = lastSetTarget;
                     SetTarget(activeSignal, fillTarget);
                     Log0("TP re-set from fill -> " + Fmt(fillTarget));
                 }
@@ -1488,7 +1515,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     entryOrder1 = null;
                 // Cancelled from outside the strategy (chart / Orders tab): treat it as "stop", or AUTO would send it again.
                 // The other half of a split and AUTO OFF are handled on the next update, not inside this callback.
-                if (ours && orderState == OrderState.Cancelled && !entryCancelRequested && armed && State == State.Realtime)
+                // Not counted: NinjaTrader's own cancels in the first seconds of realtime (historical orders) and around
+                // the 17:00 ET close (exit on session close)
+                TimeSpan etNow = ToEt(time).TimeOfDay;
+                bool ntOwnCancel = (DateTime.Now - realtimeSince).TotalSeconds < 10
+                    || (etNow >= new TimeSpan(16, 55, 0) && etNow < new TimeSpan(17, 5, 0));
+                if (ours && orderState == OrderState.Cancelled && !entryCancelRequested && !ntOwnCancel && armed && State == State.Realtime)
                 {
                     Log0("Entry cancelled outside the strategy");
                     pendingDisarm = "entry cancelled on the chart";
@@ -1506,6 +1538,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Order o = execution.Order;
             if (o == null)
                 return;
+            lastFillWall = DateTime.Now;
 
             if (IsEntrySignal(o.Name) && !tradeOpen)
             {
@@ -1942,6 +1975,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             TriggerCustomEvent(o =>
             {
+                ProcessPending();   // a fill's AUTO OFF / day limits first
                 armed = !armed;
                 Log0(armed ? "AUTO ON (manual)" : "AUTO OFF (manual)");
                 if (armed) ManageEntry(0); else CancelEntry();
@@ -1954,6 +1988,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             TriggerCustomEvent(o =>
             {
+                ProcessPending();   // a fill's AUTO OFF / day limits first
                 Direction = Direction == EmaRejDirection.Both ? EmaRejDirection.LongOnly
                           : Direction == EmaRejDirection.LongOnly ? EmaRejDirection.ShortOnly : EmaRejDirection.Both;
                 ManageEntry(0);
@@ -1966,6 +2001,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             TriggerCustomEvent(o =>
             {
+                ProcessPending();   // a fill's AUTO OFF / day limits first
                 armed = false;
                 CancelEntry();
                 Position p = Positions[execIdx];
@@ -1984,6 +2020,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             TriggerCustomEvent(o =>
             {
+                ProcessPending();   // a fill's AUTO OFF / day limits first
                 SideState other = s == longSide ? shortSide : longSide;
                 other.Forced = false;
                 s.Forced     = true;
@@ -2002,6 +2039,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ManageEntry(0);
                 if (dayBlock.Length > 0)
                     Log0((s.Dir > 0 ? "BUY" : "SELL") + " blocked: " + dayBlock);
+                else if (accountBlock.Length > 0)
+                    Log0((s.Dir > 0 ? "BUY" : "SELL") + " blocked: " + accountBlock);
                 else if (entryOrder == null && planValid && planTooClose)
                     Log0((s.Dir > 0 ? "BUY" : "SELL") + " waiting: needs price " + (s.Dir > 0 ? ">= " : "<= ")
                         + Fmt(planEntry + s.Dir * MinDistFromPricePts) + " (entry " + Fmt(planEntry) + ")");
