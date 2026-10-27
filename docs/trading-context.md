@@ -14,8 +14,8 @@ Paths are relative to the repo root, `NinjaTrader 8\bin\Custom` (Documents may s
 |---|---|---|
 | `..\..\log\EmaRejection.yyyyMMdd.txt` | strategy events: orders, fills, drags, chop, auto on/off | the strategy |
 | `..\..\log\log.yyyyMMdd.*.txt` | NinjaTrader order states and fill prices | NinjaTrader |
-| `..\..\analysis\trades.csv` | one row per live / Sim / Playback trade: size, entry, stop and TP (initial and final), exit, P&L, R, MAE/MFE, trend, chop | the strategy |
-| `..\..\analysis\levels.txt` | current prior-session, overnight and session levels, VWAP, EMA, trend, chop (about once a minute) | the strategy |
+| `..\..\analysis\trades.csv` | one row per live / Sim / Playback trade: size, entry, stop and TP (initial and final), exit, P&L, R, MAE/MFE, trend, chop, and context at entry: session, 15-min trend (EMA 12), position vs the prior RTH value area, nearest key level and distance | the strategy |
+| `..\..\analysis\levels.txt` | current prior-session, overnight and session levels, prior RTH value area (VAH/POC/VAL), opening range, initial balance, VWAP, EMA, trend, chop (about once a minute) | the strategy |
 | `..\..\analysis\*.csv` (other) | Strategy Analyzer trade exports (Trades tab → right-click → Export, CSV) | the user |
 | `..\..\analysis\playbook.md` | adopted playbook cards | strategy-analyst |
 | `..\..\analysis\sizing.md` | approved size per account and grade | from risk-manager's verdict |
