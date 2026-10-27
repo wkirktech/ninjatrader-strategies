@@ -930,9 +930,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopFallback = true;   // check again on a later tick, once this change has had time to land
                 return;
             }
-            // Engine already held this price and left the order alone: put a looser stop back directly
-            if (Math.Abs(stopOrder.StopPrice - lastSetStop) > execTick * 0.5)
-                ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
+            // Engine already held this price and left the order alone: put a looser stop back directly. Sent without checking
+            // stopOrder.StopPrice, which can show the old price on some connections; at worst one redundant modify.
+            ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
             syncStop = stopFallback = false;
         }
 
@@ -982,7 +982,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // A tighter stop asked for is only taken once the broker accepts the change (a stop past the market is rejected)
                     if (!isRequest && pendingTighten > 0)
                     {
-                        if (error == ErrorCode.NoError)
+                        // Skipped if the stop moved past it meanwhile (e.g. the profit lock)
+                        if (error == ErrorCode.NoError && (activeSignal == SigLong ? 1 : -1) * (pendingTighten - lastSetStop) > execTick * 0.5)
                         {
                             lastSetStop = pendingTighten;
                             // Tell the managed engine right away, or it puts the stop back on the next tick
