@@ -29,7 +29,11 @@ namespace NinjaTrader.NinjaScript.Strategies
     {
         private const string SigLong  = "EMAR_L";
         private const string SigShort = "EMAR_S";
-        private const string Tp1Suffix = "1";   // the scale-out half of a split entry: EMAR_L1 / EMAR_S1
+        private const string Tp1Suffix = "1";
+        // Split targets are switched off in code: every NinjaTrader lock-up (2026-10-26 21:56, 22:17, 2026-10-27 07:33) was
+        // a split trade (two entries + per-entry stops on Rithmic), and none happened without it. To be rebuilt as one entry
+        // with a strategy-managed partial exit before it comes back.
+        private static readonly bool SplitAvailable = false;   // the scale-out half of a split entry: EMAR_L1 / EMAR_S1
 
         private class SideState
         {
@@ -274,7 +278,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Configure)
             {
                 // Split: two entries (scale-out + runner), each with its own stop and target
-                if (SplitTargets && Contracts >= 2)
+                if (SplitAvailable && SplitTargets && Contracts >= 2)
                 {
                     EntryHandling      = EntryHandling.UniqueEntries;
                     StopTargetHandling = StopTargetHandling.PerEntryExecution;
@@ -318,7 +322,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
             else if (State == State.Realtime)
+            {
                 realtimeSince = DateTime.Now;
+                if (SplitTargets && Contracts >= 2 && !SplitAvailable)
+                    Log0("Split targets are disabled in this version: " + Contracts + " contracts trade as one entry");
+            }
             else if (State == State.Terminated)
             {
                 // Trades booked in a fill callback but not yet applied still reach the journal
@@ -1289,7 +1297,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             string sig = s.Dir > 0 ? SigLong : SigShort;
             int stopTicks = Math.Max(1, (int)Math.Round(StopLossPts / execTick));
             // Split: half scales out at TP1 (odd counts give the runner the extra contract)
-            splitActive = SplitTargets && Contracts >= 2;
+            splitActive = SplitAvailable && SplitTargets && Contracts >= 2;
             int scaleQty = splitActive ? Contracts / 2 : 0;
             SetStopLoss(sig, CalculationMode.Ticks, stopTicks, false);
             SetTarget(sig, planTarget);
@@ -1850,7 +1858,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 t += "  SL " + Fmt(planStop) + "  TP " + Fmt(planTarget)
                     + (planFallback ? " (min " + (StopLossPts * MinTargetR).ToString("0.##") +(double.IsNaN(planLeg) ? ", no leg)" : ", " + legName + Fmt(planLeg) + " too close)") : " (" + legName + Fmt(planLeg) + ")")
                     + "  " + (risk > 0 ? (reward / risk).ToString("0.00") : "-") + "R\n";
-                if (SplitTargets && Contracts >= 2)
+                if (SplitAvailable && SplitTargets && Contracts >= 2)
                     t += "  Split: " + (Contracts / 2) + " to TP1 " + Fmt(Tp1Price(planDir, planEntry)) + ", " + (Contracts - Contracts / 2) + " runner\n";
                 string waitWhy = dayBlock.Length > 0 ? "DAY LIMIT (" + dayBlock + ")"
                     : accountBlock.Length > 0 ? "BLOCKED (" + accountBlock + ")" : pauseReason.Length > 0 ? "PAUSED (" + pauseReason + ")" : planTooClose ?"waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
@@ -2201,7 +2209,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double ProfitLockPts { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Split targets (2+ contracts)", Description = "Two entry limits at the same price: half the contracts exit at TP1, the rest (the runner, which gets the extra contract on odd counts) at the leg target. Both share the locked stop. Each TP can be dragged on its own. No effect with 1 contract.", Order = 9, GroupName = "3. Exits")]
+        [Display(Name = "Split targets (2+ contracts)", Description = "DISABLED in this version (NinjaTrader lock-ups); has no effect. Two entry limits at the same price: half the contracts exit at TP1, the rest (the runner, which gets the extra contract on odd counts) at the leg target. Both share the locked stop. Each TP can be dragged on its own. No effect with 1 contract.", Order = 9, GroupName = "3. Exits")]
         public bool SplitTargets { get; set; }
 
         [NinjaScriptProperty]
