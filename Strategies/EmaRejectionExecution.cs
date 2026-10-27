@@ -439,6 +439,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // The value area is computed once RTH has closed, so during a session it is always the prior RTH day's.
         private void UpdateRthProfile(DateTime et, int c)
         {
+            // Bars are stamped at their close: on minute bars use the bar's start, so the pre-open bar stays out
+            if (BarsPeriod.BarsPeriodType == BarsPeriodType.Minute)
+                et = et.AddMinutes(-BarsPeriod.Value);
+            else if (BarsPeriod.BarsPeriodType == BarsPeriodType.Second)
+                et = et.AddSeconds(-BarsPeriod.Value);
             TimeSpan tod = et.TimeOfDay;
             if (tod >= new TimeSpan(9, 30, 0) && tod < new TimeSpan(16, 0, 0))
             {
@@ -450,7 +455,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     orHigh = ibHigh = double.MinValue;
                     orLow  = ibLow  = double.MaxValue;
                 }
-                double bin = Math.Round(Close[c]);
+                double bin = Math.Round(Close[c], MidpointRounding.AwayFromZero);   // default rounding favours even bins
                 double v;
                 rthVolume.TryGetValue(bin, out v);
                 rthVolume[bin] = v + Volume[c];
@@ -1060,6 +1065,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ctxSession, ctxTf15, ctxValue, ctxLevel, ctxLevel.Length > 0 ? Num(ctxDist) : ""
             });
             string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", "trades.csv");
+            // A file written with older columns is set aside, so every row in trades.csv matches its header
+            try
+            {
+                if (System.IO.File.Exists(path))
+                {
+                    string first;
+                    using (System.IO.StreamReader r = new System.IO.StreamReader(path))
+                        first = r.ReadLine();
+                    if (first != null && first.Trim().TrimStart('﻿') != JournalHeader)
+                        lock (logFileLock)
+                            System.IO.File.Move(path, System.IO.Path.ChangeExtension(path, null) + "." + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
+                }
+            }
+            catch (Exception ex) { Print(Name + ": could not check trades.csv header (" + ex.Message + ")"); }
             bool header = !System.IO.File.Exists(path);
             WriteAnalysisFile("trades.csv", (header ? JournalHeader + Environment.NewLine : "") + row + Environment.NewLine, true);
         }
