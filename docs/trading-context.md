@@ -35,13 +35,15 @@ Size (contracts), entry, stop loss, take profit, grade, exit price, result in R.
 ## Grades and size
 | Grade | Conditions (hypothesis, the data confirms or changes it) | Starting size, MNQ (scale per account) |
 |---|---|---|
-| A+ | planned reward ≥ 3R, with higher-timeframe trend, not in chop, at a key level (PDH/PDL, VAH/VAL, VWAP) | max: 3–4 |
+| A+ | a **confirmed liquidity raid** at a key level (PDH/PDL, ONH/ONL, VAH/VAL), planned reward ≥ 3R, with higher-timeframe trend, not in chop | max: 3–4 |
 | A | planned reward ≥ 2R, with trend | average: 2–3 |
 | B | planned reward ≥ 1R, everything else that passes the filters | base: 1–2 |
 
 - A grade is real only if its expectancy clearly beats the grade below, out of sample. Until then it trades at B size. If A+ doesn't beat A, merge them.
 - One full stop (incl. commission and 1 tick slippage per side) ≤ ~10% of the **remaining** drawdown (the full drawdown at the start). Example: $1,000 drawdown → A+ is 1–2 MNQ (2 MNQ ≈ $105 with costs). As room shrinks, size shrinks.
 - No entry in `sizing.md` for an account: B size only.
+- **High volatility overrides the grade:** when the volatility read (e.g. the largest recent 1-min candle) is high, size is B (small), even for A+. More noise means more stop-outs at the same stop. Volatility is a dashboard read, not an entry signal; its thresholds are set from data.
+- A+ requires a confirmed raid (the user's rule) until the strategy-analyst shows with data that another setup beats A out of sample.
 
 ## Accounts
 - Prop firms: Tradeify and Lucid. Drawdown $1,000–2,000 depending on the account. Some plans trail intraday, others end-of-day; check per account and note where the floor stops trailing (often at the starting balance).
