@@ -37,7 +37,7 @@ Built for NQ / MNQ index futures on fast execution charts (377-tick, 1-min, 3-mi
 | **Entry** | Limit at EMA − offset (short) / EMA + offset (long). It is moved with the EMA every bar, and only placed while it can rest a minimum distance away from the market, so it never fills instantly. |
 | **Stop** | Fixed points from the fill (default 25). You can drag it tighter; if you drag it further away, it snaps back. |
 | **Target** | The setup's lower low (short) / higher high (long) plus a buffer, never closer than a minimum R-multiple (default 1:1). It extends with the leg until you drag it; wherever you drop it, it stays. |
-| **Split targets** | With 2+ contracts: two entry limits at the same price. Half exits at TP1 (default 1R), the runner at the leg target; both share the locked stop, and the runner's stop moves to breakeven after TP1 (optional). Each TP can be dragged on its own. |
+| **Split targets** | Off by default (not yet proven in Sim). With 2+ contracts: two entry limits at the same price. Half exits at TP1 (default 1R), the runner at the leg target; both share the locked stop, and the runner's stop moves to breakeven after TP1 (optional). Each TP can be dragged on its own. |
 | **Profit lock** | Off by default. When on, at +30 pts the stop moves to +12 pts (both configurable). |
 | **Automation** | Stays armed and takes every new setup until a full stop-loss hit (configurable), or until you switch it off. |
 | **Day limits** | Optional daily stop ($), max losing trades and max trades. A trade is only taken if its full stop keeps the day inside the daily stop; once a limit is hit, AUTO turns off for the day. |

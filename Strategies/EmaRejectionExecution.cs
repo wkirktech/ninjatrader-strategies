@@ -90,8 +90,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime rthDay = DateTime.MinValue;
         private bool rthValueDone = true;
         private double vah, val, poc, orHigh, orLow, ibHigh, ibLow;
-        private int tf15Idx;
-        private EMA ema15;
+        // 15-min trend built from the chart's own bars (an extra 15-min data series was involved in an NT lock-up)
+        private long m15Bucket = -1;
+        private double m15LastClose, m15Closed, m15Ema;
+        private int m15Count;
         private string ctxSession = "", ctxTf15 = "", ctxValue = "", ctxLevel = "";
         private double ctxDist;
         private DateTime lastLevelsWrite = DateTime.MinValue;
@@ -150,6 +152,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int runnerOpen, scaleOpen;   // contracts still open per entry signal, so exits name their own entry
         private bool cancelLeftover;
         private Order leftoverEntry, leftoverEntry1;   // entry orders still open when a trade went flat
+        // Work found in the fill callbacks and done on the next update of the execution series (ProcessPending): order
+        // methods there deadlocked NinjaTrader twice on 2026-10-26 ("Write lock may not be acquired with read lock held")
+        private bool fillPending, bePending;
+        private double fillPrice, beStop;
+        private DateTime fillTime;
+        private string pendingDisarm = "";
+        private readonly List<ClosedTrade> pendingCloses = new List<ClosedTrade>();
+        private bool entryCancelRequested;   // our own CancelEntry; any other cancel of an entry came from outside
+        private string accountBlock = "";
+        private bool entryIgnoredLogged;
+
+        private class ClosedTrade
+        {
+            public double Pnl;
+            public string Message;
+            public string Row;
+        }
         private double lastSetTp1, prevSetTp1;
         private double planEma;
         private string planNote = "";
@@ -242,7 +261,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxLossesPerDay         = 3;
                 CostPerContractUsd      = 2.5;
 
-                SplitTargets            = true;
+                SplitTargets            = false;   // off until it has passed Sim (two NT lock-ups on 2026-10-26)
+                TraceOrdersToOutput     = false;
                 Tp1R                    = 1;
                 RunnerToBreakeven       = true;
 
@@ -269,14 +289,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     AddDataSeries(exec);
                     execIdx = 1;
                 }
-                // 15-min bars of the chart instrument: higher-timeframe trend for the trade journal
-                AddDataSeries(BarsPeriodType.Minute, 15);
-                tf15Idx = execIdx + 1;
+                TraceOrders = TraceOrdersToOutput;
             }
             else if (State == State.DataLoaded)
             {
                 ema = EMA(Closes[0], EmaPeriod);
-                ema15 = EMA(Closes[tf15Idx], 12);
                 if (ShowEma)
                     AddChartIndicator(ema);
 
@@ -331,16 +348,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (BarsInProgress == execIdx)
             {
-                if (cancelLeftover)
-                {
-                    cancelLeftover = false;
-                    // Only the orders left over from that trade, never a fresh pair sent since
-                    foreach (Order lo in new[] { leftoverEntry, leftoverEntry1 })
-                        if (lo != null && !Order.IsTerminalState(lo.OrderState)
-                            && lo.OrderState != OrderState.CancelPending && lo.OrderState != OrderState.CancelSubmitted)
-                            CancelOrder(lo);
-                    leftoverEntry = leftoverEntry1 = null;
-                }
+                ProcessPending();
                 EnforceExitDrags();
                 ManageProfitLock();
                 if (tradeOpen)
@@ -410,6 +418,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 onLow  = Math.Min(onLow, Low[c]);
             }
             UpdateRthProfile(et, c);
+            Update15MinTrend(et, Close[c]);
 
             double vol = Volume[c];
             if (vol > 0)
@@ -496,6 +505,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // 15-min closes and their EMA 12, from the chart's own closed bars. A bar stamped exactly on a 15-min mark closes the
+        // block it ends, so the time is nudged back a tick before bucketing.
+        private void Update15MinTrend(DateTime et, double close)
+        {
+            long bucket = et.AddTicks(-1).Ticks / TimeSpan.FromMinutes(15).Ticks;
+            if (bucket != m15Bucket)
+            {
+                if (m15Bucket >= 0)
+                {
+                    m15Closed = m15LastClose;
+                    m15Ema    = m15Count == 0 ? m15Closed : m15Ema + 2.0 / 13 * (m15Closed - m15Ema);
+                    m15Count++;
+                }
+                m15Bucket = bucket;
+            }
+            m15LastClose = close;
+        }
+
         // POC = busiest bin; the value area grows from it, taking the busier neighbour each step, until it holds 70% of the volume
         private void ComputeValueArea()
         {
@@ -537,8 +564,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 : tod < new TimeSpan(16, 0, 0) ? "close" : "post";
 
             // Last closed 15-min bar vs its EMA 12
-            ctxTf15 = CurrentBars[tf15Idx] > 13
-                ? (Closes[tf15Idx][1] > ema15[1] ? "up" : Closes[tf15Idx][1] < ema15[1] ? "down" : "flat") : "";
+            ctxTf15 = m15Count >= 12 ? (m15Closed > m15Ema ? "up" : m15Closed < m15Ema ? "down" : "flat") : "";
 
             ctxValue = vah > 0 ? (price > vah ? "above" : price < val ? "below" : "inside") : "";
 
@@ -985,7 +1011,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Log0("Entries blocked: " + block);
             dayBlock = block;
 
-            bool allowed = planValid && pauseReason.Length == 0 && dayBlock.Length == 0 && armed && CanTradeNow() && InSession(c);
+            // A position on this account the strategy didn't open (manual / ATM) would mix with ours: no entries until it's flat
+            string acct = CanTradeNow() && State == State.Realtime && PositionsAccount[execIdx].MarketPosition != MarketPosition.Flat
+                ? "account has a position the strategy doesn't own (" + PositionsAccount[execIdx].MarketPosition + " "
+                  + PositionsAccount[execIdx].Quantity + ")" : "";
+            if (acct != accountBlock && acct.Length > 0 && planValid && armed)
+                Log0("Entries blocked: " + acct);
+            accountBlock = acct;
+
+            DropFinishedEntries();
+            bool allowed = planValid && pauseReason.Length == 0 && dayBlock.Length == 0 && accountBlock.Length == 0
+                && armed && CanTradeNow() && InSession(c);
             if (!allowed)
             {
                 CancelEntry();
@@ -1066,7 +1102,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             Disarm(dayStopReason);
         }
 
-        // All contracts are out: book the trade once for the day limits and the journal
+        // All contracts are out: work out the trade now (pure math, no I/O or order calls inside the fill callback),
+        // and book it for the day limits and the journal on the next update (ApplyClosedTrades)
         private void CloseTrade()
         {
             if (tradeQty <= 0 || exitQty <= 0)
@@ -1078,16 +1115,31 @@ namespace NinjaTrader.NinjaScript.Strategies
             costEstimated = tradeCommission <= 0 && CostPerContractUsd > 0;
             if (costEstimated)
                 tradeCommission = CostPerContractUsd * exitQty;
-            double pnl     = pts * Instruments[execIdx].MasterInstrument.PointValue * exitQty - tradeCommission;
-            dayPnl += pnl;
-            if (pnl < 0)
-                dayLosses++;
-            Log0("Trade closed " + Usd(pnl) + " (" + pts.ToString("0.##") + " pts), day " + Usd(dayPnl));
-            CheckDayLimits();   // before the file write, so a slow or locked file can't delay AUTO OFF
-            WriteJournal(entryPx, exitPx, pts, pnl);
+            double pnl = pts * Instruments[execIdx].MasterInstrument.PointValue * exitQty - tradeCommission;
+            pendingCloses.Add(new ClosedTrade
+            {
+                Pnl     = pnl,
+                Message = "Trade closed " + Usd(pnl) + " (" + pts.ToString("0.##") + " pts)",
+                Row     = State == State.Realtime ? JournalRow(entryPx, exitPx, pts, pnl) : null
+            });
             // Booked: a late entry partial after this starts a fresh tally
             tradeQty   = exitQty = 0;
             entryValue = exitValue = tradeCommission = 0;
+        }
+
+        private void ApplyClosedTrades()
+        {
+            foreach (ClosedTrade ct in pendingCloses)
+            {
+                dayPnl += ct.Pnl;
+                if (ct.Pnl < 0)
+                    dayLosses++;
+                Log0(ct.Message + ", day " + Usd(dayPnl));
+                CheckDayLimits();
+                if (ct.Row != null)
+                    QueueFile(new FileWrite { Path = AnalysisPath("trades.csv"), Text = ct.Row + Environment.NewLine, Append = true, Header = JournalHeader });
+            }
+            pendingCloses.Clear();
         }
 
         private const string JournalHeader = "date,open_et,close_et,account,instrument,side,contracts,entry,stop_initial,tp_initial,"
@@ -1095,15 +1147,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             + "session,tf15_trend,value_loc,nearest_level,level_dist_pts";
 
         // One row per trade in Documents\NinjaTrader 8\analysis\trades.csv, for the strategy-analyst and risk-manager
-        private void WriteJournal(double entryPx, double exitPx, double pts, double pnl)
+        private string JournalRow(double entryPx, double exitPx, double pts, double pnl)
         {
-            if (State != State.Realtime)
-                return;
             DateTime openEt  = ToEt(tradeOpenTime);
             DateTime closeEt = ToEt(tradeCloseTime);
             double mae = Math.Max(0, tradeDir > 0 ? entryPx - tradeLow : tradeHigh - entryPx);
             double mfe = Math.Max(0, tradeDir > 0 ? tradeHigh - entryPx : entryPx - tradeLow);
-            string row = string.Join(",", new[]
+            return string.Join(",", new[]
             {
                 openEt.AddHours(6).ToString("yyyy-MM-dd"), openEt.ToString("HH:mm:ss"), closeEt.ToString("HH:mm:ss"),
                 Account.Name, Instruments[execIdx].FullName, tradeDir > 0 ? "long" : "short", exitQty.ToString(),
@@ -1113,23 +1163,73 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeChop ? "chop" : "", tradeForced ? "forced" : "", "", costEstimated ? "1" : "",
                 ctxSession, ctxTf15, ctxValue, ctxLevel, ctxLevel.Length > 0 ? Num(ctxDist) : ""
             });
-            string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", "trades.csv");
-            // A file written with older columns is set aside, so every row in trades.csv matches its header
-            try
+        }
+
+        // Fill work deferred out of NinjaTrader's order / execution callbacks, done on the execution series' next update
+        private void ProcessPending()
+        {
+            if (fillPending)
             {
-                if (System.IO.File.Exists(path))
+                fillPending = false;
+                int fdir = activeSignal == SigLong ? 1 : -1;
+                // TP was planned from the limit price: re-floor it from the actual fill (only ever further, never over a drag)
+                double fillTarget;
+                PickTarget(fdir, fillPrice, tradeLeg, out fillTarget);
+                if (tradeOpen && !targetManual && fdir * (fillTarget - lastSetTarget) > execTick * 0.5)
                 {
-                    string first;
-                    using (System.IO.StreamReader r = new System.IO.StreamReader(path))
-                        first = r.ReadLine();
-                    if (first != null && first.Trim().TrimStart('﻿') != JournalHeader)
-                        lock (logFileLock)
-                            System.IO.File.Move(path, System.IO.Path.ChangeExtension(path, null) + "." + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
+                    ownTargetPending = true;
+                    preExtendTarget = lastSetTarget;
+                    SetTarget(activeSignal, fillTarget);
+                    Log0("TP re-set from fill -> " + Fmt(fillTarget));
+                }
+                if (tradeOpen && splitActive && !tp1Done && !tp1Manual)
+                    SetTp1(activeSignal, Tp1Price(fdir, fillPrice));   // exactly Tp1R from the fill
+                tradeTpInit = lastSetTarget;
+                SnapshotContext(fillPrice, fillTime);
+                Log0((fdir > 0 ? "LONG" : "SHORT") + " filled @ " + Fmt(fillPrice) + (splitActive ? ", TP1 " + Fmt(lastSetTp1) : ""));
+            }
+
+            if (bePending)
+            {
+                bePending = false;
+                int dir = activeSignal == SigLong ? 1 : -1;
+                if (tradeOpen && Positions[execIdx].MarketPosition != MarketPosition.Flat && dir * (beStop - lastSetStop) > execTick * 0.5)
+                {
+                    lastSetStop = beStop;
+                    SetStopLoss(activeSignal, CalculationMode.Price, beStop, false);
+                    Log0("Runner stop -> breakeven " + Fmt(beStop));
                 }
             }
-            catch (Exception ex) { Print(Name + ": could not check trades.csv header (" + ex.Message + ")"); }
-            bool header = !System.IO.File.Exists(path);
-            WriteAnalysisFile("trades.csv", (header ? JournalHeader + Environment.NewLine : "") + row + Environment.NewLine, true);
+
+            if (pendingCloses.Count > 0)
+                ApplyClosedTrades();
+
+            if (lastFileError.Length > 0)
+            {
+                Print(Name + ": could not write " + lastFileError);
+                lastFileError = "";
+            }
+
+            if (pendingDisarm.Length > 0)
+            {
+                string why = pendingDisarm;
+                pendingDisarm = "";
+                Disarm(why);
+            }
+
+            if (cancelLeftover)
+            {
+                cancelLeftover = false;
+                // Only the orders left over from that trade, never a fresh pair sent since
+                foreach (Order lo in new[] { leftoverEntry, leftoverEntry1 })
+                    if (lo != null && !Order.IsTerminalState(lo.OrderState)
+                        && lo.OrderState != OrderState.CancelPending && lo.OrderState != OrderState.CancelSubmitted)
+                    {
+                        entryCancelRequested = true;
+                        CancelOrder(lo);
+                    }
+                leftoverEntry = leftoverEntry1 = null;
+            }
         }
 
         private DateTime ToEt(DateTime t)
@@ -1162,15 +1262,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetTp1(sig, Tp1Price(s.Dir, planEntry));
             }
 
+            entryCancelRequested = false;
             Order o = s.Dir > 0
                 ? EnterLongLimit(execIdx, true, Contracts - scaleQty, planEntry, sig)
                 : EnterShortLimit(execIdx, true, Contracts - scaleQty, planEntry, sig);
             if (o == null)
+            {
+                // NinjaTrader ignored it (its order handling rules); turn on "Trace orders" to see why in the Output window
+                if (!entryIgnoredLogged)
+                    Log0((s.Dir > 0 ? "BUY" : "SELL") + " LMT ignored by NinjaTrader (see Output with Trace orders on)");
+                entryIgnoredLogged = true;
                 return;
+            }
+            entryIgnoredLogged = false;
             if (splitActive)
+            {
                 entryOrder1 = s.Dir > 0
                     ? EnterLongLimit(execIdx, true, scaleQty, planEntry, sig + Tp1Suffix)
                     : EnterShortLimit(execIdx, true, scaleQty, planEntry, sig + Tp1Suffix);
+                if (entryOrder1 == null)
+                    Log0("TP1 part ignored by NinjaTrader: trading " + (Contracts - scaleQty) + " without a split");
+            }
 
             entryOrder     = o;
             entryDir       = s.Dir;
@@ -1182,10 +1294,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void CancelEntry()
         {
+            DropFinishedEntries();
             foreach (Order o in new[] { entryOrder, entryOrder1 })
-                if (o != null && !Order.IsTerminalState(o.OrderState)
-                    && o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.CancelSubmitted)
+                if (o != null && o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.CancelSubmitted)
+                {
+                    entryCancelRequested = true;
                     CancelOrder(o);
+                }
+        }
+
+        // An entry order that is already filled, cancelled or rejected is forgotten, so a stale reference can never block
+        // the next entry (after a cancel from the chart, EMAR_x1 kept ManageEntry waiting for good)
+        private void DropFinishedEntries()
+        {
+            if (entryOrder != null && Order.IsTerminalState(entryOrder.OrderState))
+                entryOrder = null;
+            if (entryOrder1 != null && Order.IsTerminalState(entryOrder1.OrderState))
+                entryOrder1 = null;
         }
 
         // Put back a stop dragged further away (flagged in OnOrderUpdate). Waits until the drag has settled for a
@@ -1356,10 +1481,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool scale = order.Name != BaseSignal(order.Name);
             if (Order.IsTerminalState(orderState))
             {
+                bool ours = entryOrder == order || entryOrder1 == order;
                 if (entryOrder == order)
                     entryOrder = null;
                 if (entryOrder1 == order)
                     entryOrder1 = null;
+                // Cancelled from outside the strategy (chart / Orders tab): treat it as "stop", or AUTO would send it again.
+                // The other half of a split and AUTO OFF are handled on the next update, not inside this callback.
+                if (ours && orderState == OrderState.Cancelled && !entryCancelRequested && armed && State == State.Realtime)
+                {
+                    Log0("Entry cancelled outside the strategy");
+                    pendingDisarm = "entry cancelled on the chart";
+                }
             }
             else if (scale)
                 entryOrder1 = order;
@@ -1392,21 +1525,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 pendingTighten = 0;
                 changeReqSeen  = false;   // each trade re-learns whether this connection sends change requests
                 ownTargetPending = false;
-                // TP was planned from the limit price: re-floor it from the actual fill (only ever further)
                 int fdir = activeSignal == SigLong ? 1 : -1;
-                double fillTarget;
-                PickTarget(fdir, price, tradeLeg, out fillTarget);
-                if (fdir * (fillTarget - lastSetTarget) > execTick * 0.5)
-                {
-                    ownTargetPending = true;
-                    preExtendTarget = lastSetTarget;
-                    SetTarget(activeSignal, fillTarget);
-                    Log0("TP re-set from fill -> " + Fmt(fillTarget));
-                }
                 tp1Done     = tp1Manual = stopHandled = false;
+                bePending   = false;
                 runnerOpen  = scaleOpen = 0;   // counted from the fills in the tally below
-                if (splitActive)
-                    SetTp1(activeSignal, Tp1Price(fdir, price));   // exactly Tp1R from the fill
+                // TP re-set from the fill, TP1, trade context and the fill log line: next update (ProcessPending)
+                fillPending = true;
+                fillPrice   = price;
+                fillTime    = time;
                 tradesThisSession++;
                 // Journal: what the trade started with
                 tradeDir        = fdir;
@@ -1418,13 +1544,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeTpInit     = lastSetTarget;
                 tradeTrend      = trendDir;
                 tradeChop       = inChop;
-                SnapshotContext(price, time);
                 exitReason      = "";
                 // Setup is used up: a new one has to form after this trade
                 SideState s = activeSignal == SigLong ? longSide : shortSide;
                 tradeForced = s.Forced;
                 s.Reset(false);
-                Log0((activeSignal == SigLong ? "LONG" : "SHORT") + " filled @ " + Fmt(price) + (splitActive ? ", TP1 " + Fmt(lastSetTp1) : ""));
             }
             else if ((o.Name == "Stop loss" || o.Name == "Stop put-back") && o.OrderState == OrderState.Filled && !stopHandled)
             {
@@ -1434,26 +1558,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (profitLocked || tp1Done || (stopKnown && dir * (lastSetStop - tradeEntry) >= 0))
                 {
                     Log0("Profit-lock stop hit, setup ended");
-                    if (DisarmOnProfitLockStop) Disarm("profit-lock stop");
+                    if (DisarmOnProfitLockStop) pendingDisarm = "profit-lock stop";
                 }
                 else
                 {
                     Log0("STOPPED OUT");
-                    if (DisarmOnStopLoss) Disarm("stop loss");
+                    if (DisarmOnStopLoss) pendingDisarm = "stop loss";
                 }
             }
             else if (o.Name == "Profit target" && o.OrderState == OrderState.Filled && IsTp1Exit(o))
             {
                 tp1Done = true;
                 Log0("TP1 hit @ " + Fmt(price));
-                // Runner still open: its stop goes to breakeven (never loosened)
-                int dir = activeSignal == SigLong ? 1 : -1;
+                // Runner still open: its stop goes to breakeven on the next update (never loosened)
                 double be = tradeQty > 0 ? Rnd(entryValue / tradeQty) : tradeEntry;
-                if (RunnerToBreakeven && tradeQty - exitQty - quantity > 0 && dir * (be - lastSetStop) > execTick * 0.5)
+                if (RunnerToBreakeven && tradeQty - exitQty - quantity > 0)
                 {
-                    lastSetStop = be;
-                    SetStopLoss(activeSignal, CalculationMode.Price, be, false);
-                    Log0("Runner stop -> breakeven " + Fmt(be));
+                    bePending = true;
+                    beStop    = be;
                 }
             }
             else if (o.Name == "Profit target" && o.OrderState == OrderState.Filled)
@@ -1546,37 +1668,85 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Same lines as the Output window, also kept in Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt
         // (prefixed with the PC clock) so they survive a restart and can be read without copy-pasting.
-        private static readonly object logFileLock = new object();
+        // All file writes go through one background writer, so NinjaTrader's order / execution threads never wait on the
+        // disk (or OneDrive). Lines keep their order because one writer drains one queue.
+        private class FileWrite
+        {
+            public string Path;
+            public string Text;
+            public bool Append;
+            public string Header;   // csv header: written first on a new file; a file with another header is set aside
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentQueue<FileWrite> fileQueue =
+            new System.Collections.Concurrent.ConcurrentQueue<FileWrite>();
+        private static int fileWriterBusy;
+        private static string lastFileError = "";
+
+        private static void QueueFile(FileWrite w)
+        {
+            fileQueue.Enqueue(w);
+            if (System.Threading.Interlocked.CompareExchange(ref fileWriterBusy, 1, 0) == 0)
+                System.Threading.ThreadPool.QueueUserWorkItem(_ => DrainFiles());
+        }
+
+        private static void DrainFiles()
+        {
+            while (true)
+            {
+                FileWrite w;
+                while (fileQueue.TryDequeue(out w))
+                {
+                    try
+                    {
+                        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(w.Path));
+                        if (w.Header != null)
+                        {
+                            if (System.IO.File.Exists(w.Path))
+                            {
+                                string first;
+                                using (System.IO.StreamReader r = new System.IO.StreamReader(w.Path))
+                                    first = r.ReadLine();
+                                if (first != null && first.Trim().TrimStart('﻿') != w.Header)
+                                    System.IO.File.Move(w.Path, System.IO.Path.ChangeExtension(w.Path, null)
+                                        + "." + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
+                            }
+                            if (!System.IO.File.Exists(w.Path))
+                                System.IO.File.WriteAllText(w.Path, w.Header + Environment.NewLine);
+                        }
+                        if (w.Append)
+                            System.IO.File.AppendAllText(w.Path, w.Text);
+                        else
+                            System.IO.File.WriteAllText(w.Path, w.Text);
+                    }
+                    catch (Exception ex) { lastFileError = System.IO.Path.GetFileName(w.Path) + ": " + ex.Message; }   // never stop the strategy
+                }
+                System.Threading.Interlocked.Exchange(ref fileWriterBusy, 0);
+                // A write queued between the last dequeue and the reset is picked up here
+                if (fileQueue.IsEmpty || System.Threading.Interlocked.CompareExchange(ref fileWriterBusy, 1, 0) != 0)
+                    return;
+            }
+        }
 
         private void WriteLogFile(string line)
         {
-            try
+            QueueFile(new FileWrite
             {
-                string path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "log",
-                    "EmaRejection." + DateTime.Now.ToString("yyyyMMdd") + ".txt");
-                lock (logFileLock)
-                    System.IO.File.AppendAllText(path, DateTime.Now.ToString("HH:mm:ss.fff") + " " + Account.Name + " " + line + Environment.NewLine);
-            }
-            catch (Exception) { }   // logging must never stop the strategy
+                Path   = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "log", "EmaRejection." + DateTime.Now.ToString("yyyyMMdd") + ".txt"),
+                Text   = DateTime.Now.ToString("HH:mm:ss.fff") + " " + Account.Name + " " + line + Environment.NewLine,
+                Append = true
+            });
         }
 
         // Files for the agents in Documents\NinjaTrader 8\analysis\ (outside the repo)
+        private static string AnalysisPath(string name)
+        {
+            return System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", name);
+        }
+
         private void WriteAnalysisFile(string name, string text, bool append)
         {
-            try
-            {
-                string dir = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis");
-                System.IO.Directory.CreateDirectory(dir);
-                string path = System.IO.Path.Combine(dir, name);
-                lock (logFileLock)
-                {
-                    if (append)
-                        System.IO.File.AppendAllText(path, text);
-                    else
-                        System.IO.File.WriteAllText(path, text);
-                }
-            }
-            catch (Exception ex) { Print(Name + ": could not write analysis\\" + name + " (" + ex.Message + ")"); }   // never stop the strategy
+            QueueFile(new FileWrite { Path = AnalysisPath(name), Text = text, Append = append });
         }
 
         private string SideLine(SideState s)
@@ -1627,7 +1797,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + "  " + (risk > 0 ? (reward / risk).ToString("0.00") : "-") + "R\n";
                 if (SplitTargets && Contracts >= 2)
                     t += "  Split: " + (Contracts / 2) + " to TP1 " + Fmt(Tp1Price(planDir, planEntry)) + ", " + (Contracts - Contracts / 2) + " runner\n";
-                string waitWhy = dayBlock.Length > 0 ? "DAY LIMIT (" + dayBlock + ")" : pauseReason.Length > 0 ? "PAUSED (" + pauseReason + ")" : planTooClose ?"waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
+                string waitWhy = dayBlock.Length > 0 ? "DAY LIMIT (" + dayBlock + ")"
+                    : accountBlock.Length > 0 ? "BLOCKED (" + accountBlock + ")" : pauseReason.Length > 0 ? "PAUSED (" + pauseReason + ")" : planTooClose ?"waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
                 t += "Order: " + (entryOrder != null ? entryOrder.OrderState + " @ " + Fmt(entryOrder.LimitPrice) + (planTooClose ? " (held, price close)" : "")
                     : (armed ? (CanTradeNow() ? waitWhy : "live only") : "AUTO is OFF")) + "\n";
             }
@@ -1978,6 +2149,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Runner stop to breakeven after TP1", Description = "Once TP1 fills, the runner's stop moves to the average entry (never loosened).", Order = 11, GroupName = "3. Exits")]
         public bool RunnerToBreakeven { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trace orders (Output window)", Description = "NinjaTrader prints every order the strategy sends, changes or has ignored to the NinjaScript Output window. For testing.", Order = 8, GroupName = "4. Automation")]
+        public bool TraceOrdersToOutput { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Start with AUTO on", Order = 1, GroupName = "4. Automation")]
