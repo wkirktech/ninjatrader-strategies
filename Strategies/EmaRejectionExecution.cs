@@ -131,7 +131,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double preExtendTarget;
         // Some live connections (Tradovate) report a dragged exit at its old price; the price asked for is in the change request
         private bool changeReqSeen;
-        private double looseStop;   // the looser stop being put back, so its own echo isn't a second drag
+        private double looseStop;        // the looser stop being put back, so its own echo isn't a second drag
+        private double pendingTighten;   // a tighter stop asked for, taken once the broker accepts it (0 = none)
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -981,18 +982,31 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (order.Name == "Stop loss")
                 {
                     stopOrder = order;
+                    // A tighter stop asked for is only taken once the broker accepts the change (a stop past the market is rejected)
+                    if (!isRequest && pendingTighten > 0)
+                    {
+                        if (error == ErrorCode.NoError)
+                        {
+                            lastSetStop = pendingTighten;
+                            // Tell the managed engine right away, or it puts the stop back on the next tick
+                            SetStopLoss(activeSignal, CalculationMode.Price, pendingTighten, false);
+                            Log0("SL tightened manually -> " + Fmt(pendingTighten));
+                        }
+                        pendingTighten = 0;
+                    }
                     double px = isRequest ? order.StopPriceChanged : stopPrice;
                     if (isRequest && px > 0)
                         changeReqSeen = true;
                     if (px > 0 && (isRequest || !changeReqSeen))
                     {
                         double d = dir * (px - lastSetStop);
-                        if (!stopKnown || d > execTick * 0.5)
+                        if (stopKnown && isRequest && d > execTick * 0.5)
+                            pendingTighten = px;
+                        else if (!stopKnown || d > execTick * 0.5)
                         {
                             lastSetStop = px;
                             if (stopKnown)
                             {
-                                // Tell the managed engine right away, or it puts the stop back on the next tick
                                 SetStopLoss(activeSignal, CalculationMode.Price, px, false);
                                 Log0("SL tightened manually -> " + Fmt(px));
                             }
@@ -1067,6 +1081,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 syncStop      = false;
                 stopFallback  = false;
                 stopOrder     = null;
+                pendingTighten = 0;
+                changeReqSeen  = false;   // each trade re-learns whether this connection sends change requests
                 ownTargetPending = false;
                 // TP was planned from the limit price: re-floor it from the actual fill (only ever further)
                 int fdir = o.Name == SigLong ? 1 : -1;
