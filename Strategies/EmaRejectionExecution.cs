@@ -163,6 +163,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string accountBlock = "";
         private bool entryIgnoredLogged;
         private DateTime realtimeSince = DateTime.MaxValue, lastFillWall = DateTime.MinValue;
+        private SessionIterator sessionIt;
+        private DateTime sessionEnd = DateTime.MinValue;   // chart time zone, for NinjaTrader's exit on session close
 
         private class ClosedTrade
         {
@@ -303,6 +305,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 execTick  = Instruments[execIdx].MasterInstrument.TickSize;
                 easternTz = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
+                sessionIt     = new SessionIterator(Bars);
                 isChartHosted = ChartControl != null;
                 armed = isChartHosted ? StartArmed : true;   // Strategy Analyzer / no chart: always armed
             }
@@ -371,6 +374,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (BarsInProgress != 0 || !IsFirstTickOfBar)
                 return;
+
+            // End of the chart's current trading session (its own template), read here so callbacks never touch the bars
+            if (sessionIt != null && (sessionEnd == DateTime.MinValue || Time[0] >= sessionEnd))
+            {
+                sessionIt.GetNextSession(Time[0], true);
+                sessionEnd = sessionIt.ActualSessionEnd;
+            }
 
             // Historical (no tick replay) calls once per closed bar -> bar 0 is closed.
             // Realtime first tick of a new bar -> bar 1 is the one that just closed.
@@ -1517,10 +1527,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // The other half of a split and AUTO OFF are handled on the next update, not inside this callback.
                 // Not counted: NinjaTrader's own cancels in the first seconds of realtime (historical orders) and around
                 // the 17:00 ET close (exit on session close)
-                TimeSpan etNow = ToEt(time).TimeOfDay;
-                bool ntOwnCancel = (DateTime.Now - realtimeSince).TotalSeconds < 10
-                    || (etNow >= new TimeSpan(16, 55, 0) && etNow < new TimeSpan(17, 5, 0));
-                if (ours && orderState == OrderState.Cancelled && !entryCancelRequested && !ntOwnCancel && armed && State == State.Realtime)
+                if (ours && orderState == OrderState.Cancelled && !entryCancelRequested && armed && State == State.Realtime
+                    && !NtOwnCancel())
                 {
                     Log0("Entry cancelled outside the strategy");
                     pendingDisarm = "entry cancelled on the chart";
@@ -1653,6 +1661,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 tradeOpen = false;
             }
+        }
+
+        // NinjaTrader cancels entries itself in the first seconds of realtime (historical orders) and at exit on session
+        // close: within 5 min of the chart's session end (any trading-hours template) or of the 17:00 ET Globex close.
+        // Uses the PC clock only, so it can't throw inside a callback.
+        private bool NtOwnCancel()
+        {
+            if ((DateTime.Now - realtimeSince).TotalSeconds < 10)
+                return true;
+            DateTime chartNow = TimeZoneInfo.ConvertTime(DateTime.Now, NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo);
+            if (sessionEnd != DateTime.MinValue && Math.Abs((chartNow - sessionEnd).TotalMinutes) <= 5)
+                return true;
+            TimeSpan et = TimeZoneInfo.ConvertTime(DateTime.Now, easternTz).TimeOfDay;
+            return et >= new TimeSpan(16, 55, 0) && et < new TimeSpan(17, 5, 0);
         }
 
         private void Disarm(string why)
@@ -1975,8 +1997,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             TriggerCustomEvent(o =>
             {
+                // The click means the opposite of what the button showed, even if a fill's pending AUTO OFF lands first
+                bool want = !armed;
                 ProcessPending();   // a fill's AUTO OFF / day limits first
-                armed = !armed;
+                armed = want;
                 Log0(armed ? "AUTO ON (manual)" : "AUTO OFF (manual)");
                 if (armed) ManageEntry(0); else CancelEntry();
                 DrawPlan();
