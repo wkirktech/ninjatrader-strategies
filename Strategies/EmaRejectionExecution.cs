@@ -129,6 +129,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastDragTime = DateTime.MinValue;
         private bool ownTargetPending;   // our own TP change in flight: echoes at the old price aren't manual drags
         private double preExtendTarget;
+        // Some live connections (Tradovate) report a dragged exit at its old price; the price asked for is in the change request
+        private bool changeReqSeen;
+        private double looseStop;        // the looser stop being put back, so its own echo isn't a second drag
+        private double pendingTighten;   // a tighter stop asked for, taken once the broker accepts it (0 = none)
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -929,9 +933,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopFallback = true;   // check again on a later tick, once this change has had time to land
                 return;
             }
-            // Engine already held this price and left the order alone: put a looser stop back directly
-            if (Math.Abs(stopOrder.StopPrice - lastSetStop) > execTick * 0.5)
-                ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
+            // Engine already held this price and left the order alone: put a looser stop back directly. Sent without checking
+            // stopOrder.StopPrice, which can show the old price on some connections; at worst one redundant modify.
+            ChangeOrder(stopOrder, stopOrder.Quantity, 0, lastSetStop);
             syncStop = stopFallback = false;
         }
 
@@ -968,46 +972,79 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filled,
             double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string nativeError)
         {
-            // Exits dragged on the chart: a tighter stop is kept, a looser one is put back; the TP is kept wherever it is dropped
-            if (tradeOpen && (orderState == OrderState.Working || orderState == OrderState.Accepted))
+            // Exits dragged on the chart: a tighter stop is kept, a looser one is put back; the TP is kept wherever it is dropped.
+            // A drag is read from its change request (ChangePending: the price asked for). Working / Accepted prices are only
+            // used until a change request has been seen, because some connections echo the old price there.
+            bool isRequest = orderState == OrderState.ChangePending;
+            if (tradeOpen && (isRequest || orderState == OrderState.Working || orderState == OrderState.Accepted))
             {
                 int dir = activeSignal == SigLong ? 1 : -1;
                 if (order.Name == "Stop loss")
                 {
                     stopOrder = order;
-                    double d = dir * (stopPrice - lastSetStop);
-                    if (!stopKnown || d > execTick * 0.5)
+                    // A tighter stop asked for is only taken once the broker accepts the change (a stop past the market is rejected)
+                    if (!isRequest && pendingTighten > 0)
                     {
-                        lastSetStop = stopPrice;
-                        if (stopKnown)
+                        // Skipped if the stop moved past it meanwhile (e.g. the profit lock)
+                        if (error == ErrorCode.NoError && (activeSignal == SigLong ? 1 : -1) * (pendingTighten - lastSetStop) > execTick * 0.5)
                         {
+                            lastSetStop = pendingTighten;
                             // Tell the managed engine right away, or it puts the stop back on the next tick
-                            SetStopLoss(activeSignal, CalculationMode.Price, stopPrice, false);
-                            Log0("SL tightened manually -> " + Fmt(stopPrice));
+                            SetStopLoss(activeSignal, CalculationMode.Price, pendingTighten, false);
+                            Log0("SL tightened manually -> " + Fmt(pendingTighten));
                         }
-                        stopKnown = true;
+                        pendingTighten = 0;
                     }
-                    else if (d < -execTick * 0.5)
+                    double px = isRequest ? order.StopPriceChanged : stopPrice;
+                    if (isRequest && px > 0)
+                        changeReqSeen = true;
+                    if (px > 0 && (isRequest || !changeReqSeen))
                     {
-                        Log0("SL can only be tightened, back to " + Fmt(lastSetStop));
-                        lastDragTime = DateTime.Now;
-                        syncStop     = true;
-                        stopFallback = false;
+                        double d = dir * (px - lastSetStop);
+                        if (stopKnown && isRequest && d > execTick * 0.5)
+                            pendingTighten = px;
+                        else if (!stopKnown || d > execTick * 0.5)
+                        {
+                            lastSetStop = px;
+                            if (stopKnown)
+                            {
+                                SetStopLoss(activeSignal, CalculationMode.Price, px, false);
+                                Log0("SL tightened manually -> " + Fmt(px));
+                            }
+                            stopKnown = true;
+                        }
+                        else if (d < -execTick * 0.5 && !(syncStop && Math.Abs(px - looseStop) <= execTick * 0.5))
+                        {
+                            // Hold the dragged price first so the engine's copy matches the broker, then put it back
+                            looseStop = px;
+                            if (isRequest)
+                                SetStopLoss(activeSignal, CalculationMode.Price, px, false);
+                            Log0("SL can only be tightened, back to " + Fmt(lastSetStop));
+                            lastDragTime = DateTime.Now;
+                            syncStop     = true;
+                            stopFallback = false;
+                        }
                     }
                 }
                 else if (order.Name == "Profit target")
                 {
-                    bool matchesOurs = Math.Abs(limitPrice - lastSetTarget) <= execTick * 0.5;
-                    if (matchesOurs)
-                        ownTargetPending = false;   // our auto-extend has landed
-                    // Until our own change lands, an update between the oldest pending target and ours is a stale echo, not a drag
-                    else if (!ownTargetPending || dir * (limitPrice - preExtendTarget) < -execTick * 0.5
-                                               || dir * (lastSetTarget - limitPrice) < -execTick * 0.5)
+                    double px = isRequest ? order.LimitPriceChanged : limitPrice;
+                    if (isRequest && px > 0)
+                        changeReqSeen = true;
+                    if (px > 0 && (isRequest || !changeReqSeen))
                     {
-                        targetManual = true;
-                        // Tell the managed engine right away, or it puts the TP back on the next tick
-                        SetTarget(activeSignal, limitPrice);
-                        Log0("TP moved manually -> " + Fmt(limitPrice));
+                        bool matchesOurs = Math.Abs(px - lastSetTarget) <= execTick * 0.5;
+                        if (matchesOurs)
+                            ownTargetPending = false;   // our auto-extend has landed
+                        // Until our own change lands, a price between the oldest pending target and ours is a stale echo, not a drag
+                        else if (!ownTargetPending || dir * (px - preExtendTarget) < -execTick * 0.5
+                                                   || dir * (lastSetTarget - px) < -execTick * 0.5)
+                        {
+                            targetManual = true;
+                            // Tell the managed engine right away, or it puts the TP back on the next tick
+                            SetTarget(activeSignal, px);
+                            Log0("TP moved manually -> " + Fmt(px));
+                        }
                     }
                 }
             }
@@ -1045,6 +1082,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 syncStop      = false;
                 stopFallback  = false;
                 stopOrder     = null;
+                pendingTighten = 0;
+                changeReqSeen  = false;   // each trade re-learns whether this connection sends change requests
                 ownTargetPending = false;
                 // TP was planned from the limit price: re-floor it from the actual fill (only ever further)
                 int fdir = o.Name == SigLong ? 1 : -1;
