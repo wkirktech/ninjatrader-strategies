@@ -147,6 +147,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Split targets: a scale-out entry with TP1 at Tp1R, and the runner (the main signal) with the leg target
         private bool splitActive, tp1Done, tp1Manual, stopHandled;
         private Order entryOrder1;
+        private int runnerOpen, scaleOpen;   // contracts still open per entry signal, so exits name their own entry
+        private bool cancelLeftover;
         private double lastSetTp1, prevSetTp1;
         private double planEma;
         private string planNote = "";
@@ -328,6 +330,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (BarsInProgress == execIdx)
             {
+                if (cancelLeftover)
+                {
+                    cancelLeftover = false;
+                    CancelEntry();
+                }
                 EnforceExitDrags();
                 ManageProfitLock();
                 if (tradeOpen)
@@ -909,6 +916,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetStopLoss(activeSignal + Tp1Suffix, CalculationMode.Price, price, false);
         }
 
+        // Market exit of the whole trade, one order per entry signal (one order for both parts of a split hung NinjaTrader)
+        private void ExitAll(string name)
+        {
+            Position p = Positions[execIdx];
+            bool isLong = p.MarketPosition == MarketPosition.Long;
+            if (runnerOpen <= 0 && scaleOpen <= 0)
+            {
+                // Quantities unknown (e.g. a position from before a restart): exit the position as a whole
+                if (isLong) ExitLong(execIdx, p.Quantity, name, "");
+                else        ExitShort(execIdx, p.Quantity, name, "");
+                return;
+            }
+            if (runnerOpen > 0)
+            {
+                if (isLong) ExitLong(execIdx, runnerOpen, name, activeSignal);
+                else        ExitShort(execIdx, runnerOpen, name, activeSignal);
+            }
+            if (scaleOpen > 0)
+            {
+                if (isLong) ExitLong(execIdx, scaleOpen, name, activeSignal + Tp1Suffix);
+                else        ExitShort(execIdx, scaleOpen, name, activeSignal + Tp1Suffix);
+            }
+        }
+
         private static bool IsEntrySignal(string name)
         {
             return name == SigLong || name == SigShort || name == SigLong + Tp1Suffix || name == SigShort + Tp1Suffix;
@@ -1165,8 +1196,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 syncStop = stopFallback = false;
                 Log0("Price through allowed stop " + Fmt(lastSetStop) + ", exiting at market");
-                if (isLong) ExitLong(execIdx, p.Quantity, "Stop put-back", "");
-                else        ExitShort(execIdx, p.Quantity, "Stop put-back", "");
+                ExitAll("Stop put-back");
                 return;
             }
 
@@ -1362,6 +1392,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Log0("TP re-set from fill -> " + Fmt(fillTarget));
                 }
                 tp1Done     = tp1Manual = stopHandled = false;
+                runnerOpen  = scaleOpen = 0;   // counted from the fills in the tally below
                 if (splitActive)
                     SetTp1(activeSignal, Tp1Price(fdir, price));   // exactly Tp1R from the fill
                 tradesThisSession++;
@@ -1423,11 +1454,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeCommission += execution.Commission;
                 if (IsEntrySignal(o.Name))
                 {
+                    if (o.Name == BaseSignal(o.Name)) runnerOpen += quantity; else scaleOpen += quantity;
                     tradeQty   += quantity;
                     entryValue += price * quantity;
                 }
                 else
                 {
+                    if (o.FromEntrySignal == activeSignal + Tp1Suffix) scaleOpen -= quantity; else runnerOpen -= quantity;
                     exitQty        += quantity;
                     exitValue      += price * quantity;
                     exitReason      = (tp1Done && !IsTp1Exit(o) ? "TP1+" : "") + o.Name;
@@ -1444,9 +1477,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (position.Instrument == Instruments[execIdx] && marketPosition == MarketPosition.Flat)
             {
-                // A split part that never filled is not left behind once the trade is over
+                // A split part that never filled is cancelled on the next update, not inside NinjaTrader's position update
                 if (tradeOpen)
-                    CancelEntry();
+                    cancelLeftover = true;
                 tradeOpen = false;
             }
         }
@@ -1749,10 +1782,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 armed = false;
                 CancelEntry();
                 Position p = Positions[execIdx];
-                if (p.MarketPosition == MarketPosition.Long)
-                    ExitLong(execIdx, p.Quantity, "Flat", "");
-                else if (p.MarketPosition == MarketPosition.Short)
-                    ExitShort(execIdx, p.Quantity, "Flat", "");
+                if (p.MarketPosition != MarketPosition.Flat)
+                    ExitAll("Flat");
                 Log0("FLAT + AUTO OFF (manual)");
                 RefreshUi();
             }, 0, null);
