@@ -442,6 +442,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush dxPriorLow;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandVa;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandPoc;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandSingle;
 		private bool drawingBanded;
 		private static readonly int[] BandLevels = { LvPoc, LvVah, LvVal };
 
@@ -451,8 +452,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			public string Tag;
 			public double Price;
-			public bool Poc;
+			public int Kind;   // BandPoc, BandVa or BandSingle
 		}
+		private const int BandPoc = 0;
+		private const int BandVa = 1;
+		private const int BandSingle = 2;
 		private volatile List<BandLevel> bandWanted;
 		private volatile HashSet<string> bandShown = new HashSet<string>();   // drawn as global lines (copy-on-write, read while rendering)
 		private List<BandLevel> bandSent;
@@ -560,6 +564,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				PriorHighlightVaBrush = Brushes.CornflowerBlue;
 				PriorHighlightPocBrush = Brushes.Yellow;
 				PriorHighlightGlobal = true;
+				PriorHighlightSingles = true;
+				PriorHighlightSingleBrush = Brushes.Magenta;
 
 				// 4. Profile: structure markers
 				ShowInitialBalance = true;
@@ -2836,6 +2842,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			float bandOpacity = Math.Max(0, Math.Min(100, PriorHighlightOpacity)) / 100f;
 			dxBandVa = MakeBrush(PriorHighlightVaBrush, bandOpacity);
 			dxBandPoc = MakeBrush(PriorHighlightPocBrush, bandOpacity);
+			dxBandSingle = MakeBrush(PriorHighlightSingleBrush, bandOpacity);
 			dxDayType = MakeBrush(DayTypeBrush, 1f);
 			dxOpenType = MakeBrush(OpenTypeBrush, 1f);
 			dxStatsBack = MakeBrush(StatisticsBackgroundBrush, 0.75f);
@@ -2919,6 +2926,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DisposeBrush(ref dxPriorLow);
 			DisposeBrush(ref dxBandVa);
 			DisposeBrush(ref dxBandPoc);
+			DisposeBrush(ref dxBandSingle);
 			DisposeBrush(ref dxDayType);
 			DisposeBrush(ref dxOpenType);
 			DisposeBrush(ref dxStatsBack);
@@ -3509,7 +3517,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						{
 							tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + "TPOband_"
 								+ p.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) + "_" + LevelName(lv);
-							wanted.Add(new BandLevel { Tag = tag, Price = lineValue, Poc = lv == LvPoc });
+							wanted.Add(new BandLevel { Tag = tag, Price = lineValue, Kind = lv == LvPoc ? BandPoc : BandVa });
 						}
 						if (xStart >= clipRight)
 							continue;
@@ -3521,6 +3529,30 @@ namespace NinjaTrader.NinjaScript.Indicators
 						// An untouched naked level is labelled at the right edge by the naked pass
 						if (!NakedOpen(p, b, lv))
 							DrawLabel(PriorText(LevelName(lv), price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
+					}
+
+					// Single prints: one band through the middle of each run of single-print rows inside the profile
+					if (PriorHighlightSingles)
+					{
+						int n = b.RowCount;
+						for (int r = Math.Max(0, b.BottomRun); r < n - b.TopRun; r++)
+						{
+							if (b.Counts[r] != 1)
+								continue;
+							int first = r;
+							while (r + 1 < n - b.TopRun && b.Counts[r + 1] == 1)
+								r++;
+							double mid = (RowBottomPrice(b, first) + RowTopPrice(b, r)) / 2;
+							string tag = null;
+							if (wanted != null && p.Sessions.Count > 0)
+							{
+								tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + "TPOband_"
+									+ p.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) + "_SP" + first.ToString(CultureInfo.InvariantCulture);
+								wanted.Add(new BandLevel { Tag = tag, Price = mid, Kind = BandSingle });
+							}
+							if (xStart < clipRight && (tag == null || !bandShown.Contains(tag)))
+								HLine(xStart, clipRight, chartScale.GetYByValue(mid), dxBandSingle, Math.Max(1, PriorHighlightWidth), null);
+						}
 					}
 				}
 				if (wanted != null && !SameBands(wanted, bandWanted))
@@ -3768,7 +3800,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				HorizontalLine line = Draw.HorizontalLine(this, l.Tag, l.Price, true, null);
 				if (line == null)
 					continue;
-				line.Stroke = new Stroke(l.Poc ? PriorHighlightPocBrush : PriorHighlightVaBrush, DashStyleHelper.Solid,
+				line.Stroke = new Stroke(l.Kind == BandPoc ? PriorHighlightPocBrush : l.Kind == BandSingle ? PriorHighlightSingleBrush : PriorHighlightVaBrush, DashStyleHelper.Solid,
 					Math.Max(1, PriorHighlightWidth), Math.Max(0, Math.Min(100, PriorHighlightOpacity)));
 				line.IsPriceMarkerVisible = false;
 				bandDrawn[l.Tag] = l.Price;
@@ -4754,6 +4786,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			get { return Serialize.BrushToString(PriorHighlightPocBrush); }
 			set { PriorHighlightPocBrush = Serialize.StringToBrush(value); }
+		}
+
+		[Display(Name = "Highlight Single Prints", Description = "Also a band through each run of single prints (rows only one block traded) of the highlighted sessions.", GroupName = "3. Profile - Core Levels", Order = 33)]
+		public bool PriorHighlightSingles { get; set; }
+
+		[XmlIgnore]
+		[Display(Name = "Highlight Single Prints Color", Description = "Colour of the single print bands.", GroupName = "3. Profile - Core Levels", Order = 34)]
+		public Brush PriorHighlightSingleBrush { get; set; }
+
+		[Browsable(false)]
+		public string PriorHighlightSingleBrushSerialize
+		{
+			get { return Serialize.BrushToString(PriorHighlightSingleBrush); }
+			set { PriorHighlightSingleBrush = Serialize.StringToBrush(value); }
 		}
 
 		[Display(Name = "Highlight On All Charts", Description = "Draw the bands as global horizontal lines, shown on every chart of this instrument (like a drawing attached to All charts). The labels stay on this chart. Off: drawn on this chart only.", GroupName = "3. Profile - Core Levels", Order = 32)]
