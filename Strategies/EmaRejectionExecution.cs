@@ -29,11 +29,10 @@ namespace NinjaTrader.NinjaScript.Strategies
     {
         private const string SigLong  = "EMAR_L";
         private const string SigShort = "EMAR_S";
-        private const string Tp1Suffix = "1";
-        // Split targets are switched off in code: every NinjaTrader lock-up (2026-10-26 21:56, 22:17, 2026-10-27 07:33) was
-        // a split trade (two entries + per-entry stops on Rithmic), and none happened without it. To be rebuilt as one entry
-        // with a strategy-managed partial exit before it comes back.
-        private static readonly bool SplitAvailable = false;   // the scale-out half of a split entry: EMAR_L1 / EMAR_S1
+        // Split targets: one entry; once price reaches TP1 the strategy sends a market exit for half from OnBarUpdate.
+        // (The old two-entry split with per-entry stops was in every NinjaTrader lock-up: 2026-10-26 21:56, 22:17, 2026-10-27 07:33.)
+        private const string Tp1Name = "TP1";
+        private const int Tp1MinGapTicks = 8;   // TP1 must sit this far inside the target, or the target takes the whole position
 
         private class SideState
         {
@@ -150,12 +149,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double looseStop;        // the looser stop being put back, so its own echo isn't a second drag
         private double pendingTighten;   // a tighter stop asked for, taken once the broker accepts it (0 = none)
         private Order pendingTightenOrder, looseOrder;
-        // Split targets: a scale-out entry with TP1 at Tp1R, and the runner (the main signal) with the leg target
-        private bool splitActive, tp1Done, tp1Manual, stopHandled;
-        private Order entryOrder1;
-        private int runnerOpen, scaleOpen;   // contracts still open per entry signal, so exits name their own entry
+        // Split targets: half exits at market at TP1 (Tp1R from the fill), the runner keeps the leg target
+        private bool splitActive, tp1Sent, tp1Done, stopHandled;
+        private double tp1Price;
+        private string tp1Note = "";
         private bool cancelLeftover;
-        private Order leftoverEntry, leftoverEntry1;   // entry orders still open when a trade went flat
+        private Order leftoverEntry;   // entry order still open when a trade went flat
         // Work found in the fill callbacks and done on the next update of the execution series (ProcessPending): order
         // methods there deadlocked NinjaTrader twice on 2026-10-26 ("Write lock may not be acquired with read lock held")
         private bool fillPending, bePending;
@@ -176,7 +175,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             public string Message;
             public string Row;
         }
-        private double lastSetTp1, prevSetTp1;
         private double planEma;
         private string planNote = "";
         private string lastEvent = "";
@@ -268,7 +266,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxLossesPerDay         = 3;
                 CostPerContractUsd      = 2.5;
 
-                SplitTargets            = false;   // off until it has passed Sim (two NT lock-ups on 2026-10-26)
+                SplitTargets            = false;   // off until the market TP1 has passed Sim
                 TraceOrdersToOutput     = false;
                 Tp1R                    = 1;
                 RunnerToBreakeven       = true;
@@ -277,12 +275,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                // Split: two entries (scale-out + runner), each with its own stop and target
-                if (SplitAvailable && SplitTargets && Contracts >= 2)
-                {
-                    EntryHandling      = EntryHandling.UniqueEntries;
-                    StopTargetHandling = StopTargetHandling.PerEntryExecution;
-                }
                 execIdx = 0;
                 string exec = ExecutionInstrument == null ? "" : ExecutionInstrument.Trim();
                 if (exec.Length == 0 && ExecuteOnMicro)
@@ -324,8 +316,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 realtimeSince = DateTime.Now;
-                if (SplitTargets && Contracts >= 2 && !SplitAvailable)
-                    Log0("Split targets are disabled in this version: " + Contracts + " contracts trade as one entry");
             }
             else if (State == State.Terminated)
             {
@@ -373,6 +363,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 EnforceExitDrags();
                 ManageProfitLock();
+                ManageTp1();
                 if (tradeOpen)
                 {
                     tradeHigh = Math.Max(tradeHigh, Closes[execIdx][0]);
@@ -965,73 +956,61 @@ namespace NinjaTrader.NinjaScript.Strategies
             SetProfitTarget(sig, CalculationMode.Price, price);
         }
 
-        // TP1 of a split entry (sig is the runner's signal)
-        private void SetTp1(string sig, double price)
-        {
-            if (Math.Abs(price - lastSetTp1) > execTick * 0.5)
-                prevSetTp1 = lastSetTp1;   // its echo may still arrive: not a drag
-            lastSetTp1 = price;
-            SetProfitTarget(sig + Tp1Suffix, CalculationMode.Price, price);
-        }
-
         private double Tp1Price(int dir, double entry)
         {
             return Rnd(entry + dir * Tp1R * StopLossPts);
         }
 
-        // Every open part of the trade shares one stop
+        // Split targets: once price reaches TP1, half the position (the runner keeps at least 1) exits at market. Sent from
+        // OnBarUpdate, never from a fill callback, and as a market order: NinjaTrader ignores non-market exits while the
+        // stop / target are working. The stop and target follow the smaller position by themselves (ByStrategyPosition).
+        private void ManageTp1()
+        {
+            if (!splitActive || tp1Sent || !tradeOpen || fillPending)
+                return;
+            Position p = Positions[execIdx];
+            if (p.MarketPosition == MarketPosition.Flat)
+                return;
+            int qty = Math.Min(Contracts / 2, p.Quantity - 1);
+            if (qty <= 0)
+                return;   // only part of the entry filled so far: wait for more, or the target takes it all
+            bool isLong = p.MarketPosition == MarketPosition.Long;
+            int dir = isLong ? 1 : -1;
+            double px = State == State.Realtime ? (isLong ? GetCurrentBid(execIdx) : GetCurrentAsk(execIdx))
+                                                : (isLong ? Highs[execIdx][0] : Lows[execIdx][0]);
+            if (dir * (px - tp1Price) < -execTick * 0.01)
+                return;
+
+            tp1Sent = true;
+            // Target at (or next to) TP1: a market exit racing the target could overfill, so the target takes the whole position
+            if (dir * (lastSetTarget - tp1Price) < Tp1MinGapTicks * execTick - execTick * 0.01)
+            {
+                tp1Note = "skipped, TP at TP1";
+                Log0("TP1 skipped: target " + Fmt(lastSetTarget) + " is within " + Tp1MinGapTicks + " ticks of TP1");
+                return;
+            }
+            Order o = isLong ? ExitLong(execIdx, qty, Tp1Name, activeSignal) : ExitShort(execIdx, qty, Tp1Name, activeSignal);
+            tp1Note = o == null ? "ignored by NinjaTrader" : "sent";
+            Log0(o == null ? "TP1 exit ignored by NinjaTrader (see Output with Trace orders on)"
+                           : "TP1 reached " + Fmt(tp1Price) + ": " + (isLong ? "selling " : "buying ") + qty + " at market");
+        }
+
         private void SetStops(double price)
         {
             SetStopLoss(activeSignal, CalculationMode.Price, price, false);
-            // Always both: a scale-out filled in pieces can still have contracts open after the first TP1 piece fills
-            if (splitActive)
-                SetStopLoss(activeSignal + Tp1Suffix, CalculationMode.Price, price, false);
         }
 
-        // Market exit of the whole trade, one order per entry signal (one order across both parts of a split is the likely cause of a NinjaTrader stall)
+        // Market exit of the whole position
         private void ExitAll(string name)
         {
             Position p = Positions[execIdx];
-            bool isLong = p.MarketPosition == MarketPosition.Long;
-            if (runnerOpen <= 0 && scaleOpen <= 0)
-            {
-                if (!splitActive)
-                {
-                    // Quantities unknown (e.g. a position from before a restart): exit the position as a whole
-                    if (isLong) ExitLong(execIdx, p.Quantity, name, "");
-                    else        ExitShort(execIdx, p.Quantity, name, "");
-                    return;
-                }
-                // Split with unknown counts: still one exit per signal, sized as the entry was split
-                scaleOpen  = Math.Min(p.Quantity, Contracts / 2);
-                runnerOpen = p.Quantity - scaleOpen;
-            }
-            if (runnerOpen > 0)
-            {
-                if (isLong) ExitLong(execIdx, runnerOpen, name, activeSignal);
-                else        ExitShort(execIdx, runnerOpen, name, activeSignal);
-            }
-            if (scaleOpen > 0)
-            {
-                if (isLong) ExitLong(execIdx, scaleOpen, name, activeSignal + Tp1Suffix);
-                else        ExitShort(execIdx, scaleOpen, name, activeSignal + Tp1Suffix);
-            }
+            if (p.MarketPosition == MarketPosition.Long) ExitLong(execIdx, p.Quantity, name, "");
+            else                                          ExitShort(execIdx, p.Quantity, name, "");
         }
 
         private static bool IsEntrySignal(string name)
         {
-            return name == SigLong || name == SigShort || name == SigLong + Tp1Suffix || name == SigShort + Tp1Suffix;
-        }
-
-        // The runner's signal for either part of an entry
-        private static string BaseSignal(string name)
-        {
-            return name.EndsWith(Tp1Suffix) ? name.Substring(0, name.Length - Tp1Suffix.Length) : name;
-        }
-
-        private static bool IsTp1Exit(Order o)
-        {
-            return o.FromEntrySignal == SigLong + Tp1Suffix || o.FromEntrySignal == SigShort + Tp1Suffix;
+            return name == SigLong || name == SigShort;
         }
 
         private void ManageEntry(int c)
@@ -1086,10 +1065,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (entryOrder == null)
             {
-                // A scale-out entry left without its runner is cancelled first; a fresh pair goes in after
-                if (entryOrder1 != null)
-                    CancelEntry();
-                else if (farEnough)
+                if (farEnough)
                     SubmitEntry(s, cb);
                 return;
             }
@@ -1108,13 +1084,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ChangeOrder(entryOrder, entryOrder.Quantity, planEntry, 0);
                 restingAt = planEntry;
             }
-            // The scale-out limit is kept at the runner's price on its own (it may have been busy when the runner moved)
-            if (Settled(entryOrder1) && Math.Abs(entryOrder1.LimitPrice - restingAt) > execTick * 0.5)
-                ChangeOrder(entryOrder1, entryOrder1.Quantity, restingAt, 0);
 
             SetTarget(entrySignal, planTarget);
             if (splitActive)
-                SetTp1(entrySignal, Tp1Price(entryDir, restingAt));
+                tp1Price = Tp1Price(entryDir, restingAt);
         }
 
         // Day limits: "" = new entries allowed. A trade is only taken if its full stop keeps the day inside the daily stop.
@@ -1227,11 +1200,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     SetTarget(activeSignal, fillTarget);
                     Log0("TP re-set from fill -> " + Fmt(fillTarget));
                 }
-                if (tradeOpen && splitActive && !tp1Done && !tp1Manual)
-                    SetTp1(activeSignal, Tp1Price(fdir, fillPrice));   // exactly Tp1R from the fill
+                if (splitActive && !tp1Sent)
+                    tp1Price = Tp1Price(fdir, fillPrice);   // exactly Tp1R from the fill
                 tradeTpInit = lastSetTarget;
                 SnapshotContext(fillPrice, fillTime);
-                Log0((fdir > 0 ? "LONG" : "SHORT") + " filled @ " + Fmt(fillPrice) + (splitActive ? ", TP1 " + Fmt(lastSetTp1) : ""));
+                Log0((fdir > 0 ? "LONG" : "SHORT") + " filled @ " + Fmt(fillPrice) + (splitActive ? ", TP1 " + Fmt(tp1Price) : ""));
             }
 
             if (bePending)
@@ -1265,15 +1238,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (cancelLeftover)
             {
                 cancelLeftover = false;
-                // Only the orders left over from that trade, never a fresh pair sent since
-                foreach (Order lo in new[] { leftoverEntry, leftoverEntry1 })
-                    if (lo != null && !Order.IsTerminalState(lo.OrderState)
-                        && lo.OrderState != OrderState.CancelPending && lo.OrderState != OrderState.CancelSubmitted)
-                    {
-                        entryCancelRequested = true;
-                        CancelOrder(lo);
-                    }
-                leftoverEntry = leftoverEntry1 = null;
+                // Only the order left over from that trade, never a fresh one sent since
+                Order lo = leftoverEntry;
+                if (lo != null && !Order.IsTerminalState(lo.OrderState)
+                    && lo.OrderState != OrderState.CancelPending && lo.OrderState != OrderState.CancelSubmitted)
+                {
+                    entryCancelRequested = true;
+                    CancelOrder(lo);
+                }
+                leftoverEntry = null;
             }
         }
 
@@ -1296,21 +1269,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             string sig = s.Dir > 0 ? SigLong : SigShort;
             int stopTicks = Math.Max(1, (int)Math.Round(StopLossPts / execTick));
-            // Split: half scales out at TP1 (odd counts give the runner the extra contract)
-            splitActive = SplitAvailable && SplitTargets && Contracts >= 2;
-            int scaleQty = splitActive ? Contracts / 2 : 0;
+            // Split: half exits at TP1 (odd counts give the runner the extra contract)
+            splitActive = SplitTargets && Contracts >= 2;
+            tp1Price    = Tp1Price(s.Dir, planEntry);
             SetStopLoss(sig, CalculationMode.Ticks, stopTicks, false);
             SetTarget(sig, planTarget);
-            if (splitActive)
-            {
-                SetStopLoss(sig + Tp1Suffix, CalculationMode.Ticks, stopTicks, false);
-                SetTp1(sig, Tp1Price(s.Dir, planEntry));
-            }
 
             entryCancelRequested = false;
             Order o = s.Dir > 0
-                ? EnterLongLimit(execIdx, true, Contracts - scaleQty, planEntry, sig)
-                : EnterShortLimit(execIdx, true, Contracts - scaleQty, planEntry, sig);
+                ? EnterLongLimit(execIdx, true, Contracts, planEntry, sig)
+                : EnterShortLimit(execIdx, true, Contracts, planEntry, sig);
             if (o == null)
             {
                 // NinjaTrader ignored it (its order handling rules); turn on "Trace orders" to see why in the Output window
@@ -1320,42 +1288,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
             entryIgnoredLogged = false;
-            if (splitActive)
-            {
-                entryOrder1 = s.Dir > 0
-                    ? EnterLongLimit(execIdx, true, scaleQty, planEntry, sig + Tp1Suffix)
-                    : EnterShortLimit(execIdx, true, scaleQty, planEntry, sig + Tp1Suffix);
-                if (entryOrder1 == null)
-                    Log0("TP1 part ignored by NinjaTrader: trading " + (Contracts - scaleQty) + " without a split");
-            }
 
             entryOrder     = o;
             entryDir       = s.Dir;
             entrySignal    = sig;
             entrySubmitBar = cb;
             Log0((s.Dir > 0 ? "BUY" : "SELL") + " LMT " + Fmt(planEntry) + " sent"
-                + (splitActive ? " (" + scaleQty + " to TP1 " + Fmt(lastSetTp1) + ", " + (Contracts - scaleQty) + " runner)" : ""));
+                + (splitActive ? " (" + (Contracts / 2) + " at TP1 " + Fmt(tp1Price) + ", " + (Contracts - Contracts / 2) + " runner)" : ""));
         }
 
         private void CancelEntry()
         {
             DropFinishedEntries();
-            foreach (Order o in new[] { entryOrder, entryOrder1 })
-                if (o != null && o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.CancelSubmitted)
-                {
-                    entryCancelRequested = true;
-                    CancelOrder(o);
-                }
+            Order o = entryOrder;
+            if (o != null && o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.CancelSubmitted)
+            {
+                entryCancelRequested = true;
+                CancelOrder(o);
+            }
         }
 
         // An entry order that is already filled, cancelled or rejected is forgotten, so a stale reference can never block
-        // the next entry (after a cancel from the chart, EMAR_x1 kept ManageEntry waiting for good)
+        // the next entry
         private void DropFinishedEntries()
         {
             if (entryOrder != null && Order.IsTerminalState(entryOrder.OrderState))
                 entryOrder = null;
-            if (entryOrder1 != null && Order.IsTerminalState(entryOrder1.OrderState))
-                entryOrder1 = null;
         }
 
         // Put back a stop dragged further away (flagged in OnOrderUpdate). Waits until the drag has settled for a
@@ -1443,7 +1401,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         if (error == ErrorCode.NoError && dir * (pendingTighten - lastSetStop) > execTick * 0.5)
                         {
                             lastSetStop = pendingTighten;
-                            // Tell the managed engine right away, or it puts the stop back on the next tick (both parts of a split)
+                            // Tell the managed engine right away, or it puts the stop back on the next tick
                             SetStops(pendingTighten);
                             Log0("SL tightened manually -> " + Fmt(pendingTighten));
                         }
@@ -1485,19 +1443,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                     }
                 }
-                else if (order.Name == "Profit target" && IsTp1Exit(order))
-                {
-                    double px = isRequest ? order.LimitPriceChanged : limitPrice;
-                    if (isRequest && px > 0)
-                        changeReqSeen = true;
-                    bool ours = Math.Abs(px - lastSetTp1) <= execTick * 0.5 || Math.Abs(px - prevSetTp1) <= execTick * 0.5;
-                    if (px > 0 && (isRequest || !changeReqSeen) && !ours)
-                    {
-                        tp1Manual = true;
-                        SetTp1(activeSignal, px);
-                        Log0("TP1 moved manually -> " + Fmt(px));
-                    }
-                }
                 else if (order.Name == "Profit target")
                 {
                     double px = isRequest ? order.LimitPriceChanged : limitPrice;
@@ -1523,16 +1468,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (!IsEntrySignal(order.Name))
                 return;
-            bool scale = order.Name != BaseSignal(order.Name);
             if (Order.IsTerminalState(orderState))
             {
-                bool ours = entryOrder == order || entryOrder1 == order;
-                if (entryOrder == order)
+                bool ours = entryOrder == order;
+                if (ours)
                     entryOrder = null;
-                if (entryOrder1 == order)
-                    entryOrder1 = null;
                 // Cancelled from outside the strategy (chart / Orders tab): treat it as "stop", or AUTO would send it again.
-                // The other half of a split and AUTO OFF are handled on the next update, not inside this callback.
+                // AUTO OFF is handled on the next update, not inside this callback.
                 // Not counted: NinjaTrader's own cancels in the first seconds of realtime (historical orders) and around
                 // the 17:00 ET close (exit on session close)
                 if (ours && orderState == OrderState.Cancelled && !entryCancelRequested && armed && State == State.Realtime
@@ -1542,8 +1484,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     pendingDisarm = "entry cancelled on the chart";
                 }
             }
-            else if (scale)
-                entryOrder1 = order;
             else
                 entryOrder = order;
         }
@@ -1560,7 +1500,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 tradeOpen    = true;
                 profitLocked = false;
-                activeSignal = BaseSignal(o.Name);
+                activeSignal = o.Name;
                 tradeAnchor  = planAnchor;
                 tradeLeg     = planLeg;
                 targetManual = false;
@@ -1575,9 +1515,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 changeReqSeen  = false;   // each trade re-learns whether this connection sends change requests
                 ownTargetPending = false;
                 int fdir = activeSignal == SigLong ? 1 : -1;
-                tp1Done     = tp1Manual = stopHandled = false;
+                tp1Sent     = tp1Done = stopHandled = false;
+                tp1Note     = "";
                 bePending   = false;
-                runnerOpen  = scaleOpen = 0;   // counted from the fills in the tally below
                 // TP re-set from the fill, TP1, trade context and the fill log line: next update (ProcessPending)
                 fillPending = true;
                 fillPrice   = price;
@@ -1601,7 +1541,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if ((o.Name == "Stop loss" || o.Name == "Stop put-back") && o.OrderState == OrderState.Filled && !stopHandled)
             {
-                stopHandled = true;   // a split has two stops: count the stop-out once
+                stopHandled = true;   // count the stop-out once, even when it fills in pieces
                 // A stop at or past entry (profit lock, tightened by hand) or a runner after TP1 banked is not a full stop-loss
                 int dir = activeSignal == SigLong ? 1 : -1;
                 if (profitLocked || tp1Done || (stopKnown && dir * (lastSetStop - tradeEntry) >= 0))
@@ -1615,9 +1555,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (DisarmOnStopLoss) pendingDisarm = "stop loss";
                 }
             }
-            else if (o.Name == "Profit target" && o.OrderState == OrderState.Filled && IsTp1Exit(o))
+            else if (o.Name == Tp1Name && o.OrderState == OrderState.Filled)
             {
                 tp1Done = true;
+                tp1Note = "hit";
                 Log0("TP1 hit @ " + Fmt(price));
                 // Runner still open: its stop goes to breakeven on the next update (never loosened)
                 double be = tradeQty > 0 ? Rnd(entryValue / tradeQty) : tradeEntry;
@@ -1637,16 +1578,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeCommission += execution.Commission;
                 if (IsEntrySignal(o.Name))
                 {
-                    if (o.Name == BaseSignal(o.Name)) runnerOpen += quantity; else scaleOpen += quantity;
                     tradeQty   += quantity;
                     entryValue += price * quantity;
                 }
                 else
                 {
-                    if (o.FromEntrySignal == activeSignal + Tp1Suffix) scaleOpen -= quantity; else runnerOpen -= quantity;
                     exitQty        += quantity;
                     exitValue      += price * quantity;
-                    exitReason      = (tp1Done && !IsTp1Exit(o) ? "TP1+" : "") + o.Name;
+                    exitReason      = (tp1Done && o.Name != Tp1Name ? "TP1+" : "") + o.Name;
                     tradeCloseTime  = time;
                     if (exitQty >= tradeQty)
                         CloseTrade();
@@ -1660,11 +1599,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (position.Instrument == Instruments[execIdx] && marketPosition == MarketPosition.Flat)
             {
-                // A split part that never filled is cancelled on the next update, not inside NinjaTrader's position update
+                // The unfilled rest of a partly filled entry is cancelled on the next update, not inside NinjaTrader's position update
                 if (tradeOpen)
                 {
                     leftoverEntry  = entryOrder;
-                    leftoverEntry1 = entryOrder1;
                     cancelLeftover = true;
                 }
                 tradeOpen = false;
@@ -1701,6 +1639,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (!ShowPlanLines || CurrentBar < 15)
                 return;
+            if (splitActive && tradeOpen && !tp1Sent)
+                Draw.Line(this, "EMAR_TP1", false, 12, tp1Price, 0, tp1Price, Brushes.Gold, DashStyleHelper.Dash, 2);
+            else
+                RemoveDrawObject("EMAR_TP1");
             if (!planValid)
             {
                 RemoveDrawObject("EMAR_PE");
@@ -1842,8 +1784,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + (profitLocked ? "  LOCKED +" + ProfitLockPts : (UseProfitLock ? "  lock @+" + ProfitLockTriggerPts : "")) + "\n";
                 string tradeLegName = p.MarketPosition == MarketPosition.Short ? "LL " : "HH ";
                 if (splitActive)
-                    t += "  TP1 " + (tp1Done ? "hit" : Fmt(lastSetTp1) + (tp1Manual ? " (manual)" : " (" + Tp1R.ToString("0.##") + "R)"))
-                        + (tp1Done && RunnerToBreakeven ? ", runner at BE" : "") + "\n";
+                    t += "  TP1 " + Fmt(tp1Price) + " (" + Tp1R.ToString("0.##") + "R, " + (Contracts / 2) + " at market)"
+                        + (tp1Note.Length > 0 ? " " + tp1Note : "") + (tp1Done && RunnerToBreakeven ? ", runner at BE" : "") + "\n";
                 t += (splitActive ? "  TP2 " : "  TP ") + Fmt(lastSetTarget) + (targetManual ? " (manual)"
                     : double.IsNaN(tradeLeg) ? " (min)" : " (" + tradeLegName + Fmt(tradeLeg) + ")") + "\n";
             }
@@ -1858,8 +1800,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 t += "  SL " + Fmt(planStop) + "  TP " + Fmt(planTarget)
                     + (planFallback ? " (min " + (StopLossPts * MinTargetR).ToString("0.##") +(double.IsNaN(planLeg) ? ", no leg)" : ", " + legName + Fmt(planLeg) + " too close)") : " (" + legName + Fmt(planLeg) + ")")
                     + "  " + (risk > 0 ? (reward / risk).ToString("0.00") : "-") + "R\n";
-                if (SplitAvailable && SplitTargets && Contracts >= 2)
-                    t += "  Split: " + (Contracts / 2) + " to TP1 " + Fmt(Tp1Price(planDir, planEntry)) + ", " + (Contracts - Contracts / 2) + " runner\n";
+                if (SplitTargets && Contracts >= 2)
+                    t += "  Split: " + (Contracts / 2) + " at TP1 " + Fmt(Tp1Price(planDir, planEntry)) + " (market), " + (Contracts - Contracts / 2) + " runner\n";
                 string waitWhy = dayBlock.Length > 0 ? "DAY LIMIT (" + dayBlock + ")"
                     : accountBlock.Length > 0 ? "BLOCKED (" + accountBlock + ")" : pauseReason.Length > 0 ? "PAUSED (" + pauseReason + ")" : planTooClose ?"waiting: price within " + MinDistFromPricePts.ToString("0.##") + " pts of entry" : "waiting";
                 t += "Order: " + (entryOrder != null ? entryOrder.OrderState + " @ " + Fmt(entryOrder.LimitPrice) + (planTooClose ? " (held, price close)" : "")
@@ -2209,7 +2151,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double ProfitLockPts { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Split targets (2+ contracts)", Description = "DISABLED in this version (NinjaTrader lock-ups); has no effect. Two entry limits at the same price: half the contracts exit at TP1, the rest (the runner, which gets the extra contract on odd counts) at the leg target. Both share the locked stop. Each TP can be dragged on its own. No effect with 1 contract.", Order = 9, GroupName = "3. Exits")]
+        [Display(Name = "Split targets (2+ contracts)", Description = "One entry. When price reaches TP1 (gold dashed line), the strategy sends a market exit for half the contracts; the rest (the runner, which gets the extra contract on odd counts) keeps the leg target and the stop. TP1 is set here, not dragged, and needs NinjaTrader running. Skipped for a trade whose target is within 2 pts of TP1. No effect with 1 contract.", Order = 9, GroupName = "3. Exits")]
         public bool SplitTargets { get; set; }
 
         [NinjaScriptProperty]
@@ -2218,7 +2160,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double Tp1R { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Runner stop to breakeven after TP1", Description = "Once TP1 fills, the runner's stop moves to the average entry (never loosened).", Order = 11, GroupName = "3. Exits")]
+        [Display(Name = "Runner stop to breakeven after TP1", Description = "Once the TP1 exit fills, the runner's stop moves to the average entry (never loosened).", Order = 11, GroupName = "3. Exits")]
         public bool RunnerToBreakeven { get; set; }
 
         [NinjaScriptProperty]
