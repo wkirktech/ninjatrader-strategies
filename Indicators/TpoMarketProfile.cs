@@ -443,6 +443,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush dxBandVa;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandPoc;
 		private bool drawingBanded;
+		private static readonly int[] BandLevels = { LvPoc, LvVah, LvVal };
 
 		// "Highlight On All Charts": the bands found while rendering, drawn as global horizontal lines on the next bar update
 		// (drawing objects can't be created from OnRender)
@@ -453,6 +454,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			public bool Poc;
 		}
 		private volatile List<BandLevel> bandWanted;
+		private volatile HashSet<string> bandShown = new HashSet<string>();   // drawn as global lines (copy-on-write, read while rendering)
 		private List<BandLevel> bandSent;
 		private readonly Dictionary<string, double> bandDrawn = new Dictionary<string, double>();
 		private SharpDX.Direct2D1.SolidColorBrush dxDayType;
@@ -1015,6 +1017,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (!NakedPocExtend || p == null || p.Naked == null || !object.ReferenceEquals(p.NakedFor, b))
 				return false;
 			NakedLevel level = p.Naked[LvPoc];
+			return level.Active && level.HasAfter && !level.Touched;
+		}
+
+		// Is this level still untouched and labelled at the right edge by the naked pass (any naked level, not only the POC)?
+		private bool NakedOpen(TpoProfile p, TpoBuilt b, int lv)
+		{
+			if (lv == LvPoc && NakedPocOpen(p, b))
+				return true;
+			if (!NakedTracked(lv) || !LevelLabel(lv) || p == null || p.Naked == null || !object.ReferenceEquals(p.NakedFor, b))
+				return false;
+			NakedLevel level = p.Naked[lv];
 			return level.Active && level.HasAfter && !level.Touched;
 		}
 
@@ -3481,7 +3494,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 					if (xStart >= clipRight && wanted == null)
 						continue;
 
-					foreach (int lv in new[] { LvPoc, LvVah, LvVal })
+					foreach (int lv in BandLevels)
 					{
 						if (!PriorChosen(lv))
 							continue;
@@ -3490,25 +3503,23 @@ namespace NinjaTrader.NinjaScript.Indicators
 						if (!LevelValues(b, lv, out lineValue, out price))
 							continue;
 
+						// A global line shows on this chart too
+						string tag = null;
 						if (wanted != null && p.Sessions.Count > 0)
 						{
-							// A global line shows on this chart too: only the label is drawn here
-							wanted.Add(new BandLevel
-							{
-								Tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + "TPOband_"
-									+ p.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) + "_" + LevelName(lv),
-								Price = lineValue,
-								Poc = lv == LvPoc
-							});
+							tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + "TPOband_"
+								+ p.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) + "_" + LevelName(lv);
+							wanted.Add(new BandLevel { Tag = tag, Price = lineValue, Poc = lv == LvPoc });
 						}
 						if (xStart >= clipRight)
 							continue;
 
 						float y = chartScale.GetYByValue(lineValue);
-						if (wanted == null)
+						// Until its global line exists (it needs a bar update: none come with the market closed), drawn here
+						if (tag == null || !bandShown.Contains(tag))
 							HLine(xStart, clipRight, y, lv == LvPoc ? dxBandPoc : dxBandVa, Math.Max(1, PriorHighlightWidth), null);
-						// An untouched POC is labelled "nPOC" by the naked pass
-						if (!(lv == LvPoc && NakedPocOpen(p, b)))
+						// An untouched naked level is labelled at the right edge by the naked pass
+						if (!NakedOpen(p, b, lv))
 							DrawLabel(PriorText(LevelName(lv), price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
 					}
 				}
@@ -3742,7 +3753,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private void SyncGlobalBands()
 		{
 			List<BandLevel> wanted = bandWanted;
-			if (wanted == null || object.ReferenceEquals(wanted, bandSent))
+			// On a new list, and on every new bar: a line deleted by hand or by another chart's copy of the indicator comes back
+			if (wanted == null || (object.ReferenceEquals(wanted, bandSent) && !(BarsInProgress == 0 && IsFirstTickOfBar)))
 				return;
 			bandSent = wanted;
 
@@ -3751,7 +3763,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				keep.Add(l.Tag);
 				double was;
-				if (bandDrawn.TryGetValue(l.Tag, out was) && was == l.Price)
+				if (bandDrawn.TryGetValue(l.Tag, out was) && was == l.Price && DrawObjects[l.Tag] != null)
 					continue;
 				HorizontalLine line = Draw.HorizontalLine(this, l.Tag, l.Price, true, null);
 				if (line == null)
@@ -3768,6 +3780,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				RemoveDrawObject(tag);
 				bandDrawn.Remove(tag);
 			}
+			bandShown = new HashSet<string>(bandDrawn.Keys);
 		}
 
 		// Is profile 'index' one of the last "Highlight Sessions Back" sessions before the current one?
@@ -5381,120 +5394,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 		#endregion
 	}
 }
-
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private TpoMarketProfile[] cacheTpoMarketProfile;
-		public TpoMarketProfile TpoMarketProfile()
-		{
-			return TpoMarketProfile(Input);
-		}
-
-		public TpoMarketProfile TpoMarketProfile(ISeries<double> input)
-		{
-			if (cacheTpoMarketProfile != null)
-				for (int idx = 0; idx < cacheTpoMarketProfile.Length; idx++)
-					if (cacheTpoMarketProfile[idx] != null &&  cacheTpoMarketProfile[idx].EqualsInput(input))
-						return cacheTpoMarketProfile[idx];
-			return CacheIndicator<TpoMarketProfile>(new TpoMarketProfile(), input, ref cacheTpoMarketProfile);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.TpoMarketProfile TpoMarketProfile()
-		{
-			return indicator.TpoMarketProfile(Input);
-		}
-
-		public Indicators.TpoMarketProfile TpoMarketProfile(ISeries<double> input )
-		{
-			return indicator.TpoMarketProfile(input);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.TpoMarketProfile TpoMarketProfile()
-		{
-			return indicator.TpoMarketProfile(Input);
-		}
-
-		public Indicators.TpoMarketProfile TpoMarketProfile(ISeries<double> input )
-		{
-			return indicator.TpoMarketProfile(input);
-		}
-	}
-}
-
-#endregion
-
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private TpoMarketProfile[] cacheTpoMarketProfile;
-		public TpoMarketProfile TpoMarketProfile()
-		{
-			return TpoMarketProfile(Input);
-		}
-
-		public TpoMarketProfile TpoMarketProfile(ISeries<double> input)
-		{
-			if (cacheTpoMarketProfile != null)
-				for (int idx = 0; idx < cacheTpoMarketProfile.Length; idx++)
-					if (cacheTpoMarketProfile[idx] != null &&  cacheTpoMarketProfile[idx].EqualsInput(input))
-						return cacheTpoMarketProfile[idx];
-			return CacheIndicator<TpoMarketProfile>(new TpoMarketProfile(), input, ref cacheTpoMarketProfile);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.TpoMarketProfile TpoMarketProfile()
-		{
-			return indicator.TpoMarketProfile(Input);
-		}
-
-		public Indicators.TpoMarketProfile TpoMarketProfile(ISeries<double> input )
-		{
-			return indicator.TpoMarketProfile(input);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.TpoMarketProfile TpoMarketProfile()
-		{
-			return indicator.TpoMarketProfile(Input);
-		}
-
-		public Indicators.TpoMarketProfile TpoMarketProfile(ISeries<double> input )
-		{
-			return indicator.TpoMarketProfile(input);
-		}
-	}
-}
-
-#endregion
 
 #region NinjaScript generated code. Neither change nor remove.
 
