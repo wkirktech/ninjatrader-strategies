@@ -30,6 +30,15 @@ Built for NQ / MNQ index futures on fast execution charts (377-tick, 1-min, 3-mi
 
 **Long (bounce)** is the mirror image, with bounces making **higher lows**.
 
+**Trend pullback** (*Setup mode*: Rejection / Trend pullback / Either, default Either). Long side; shorts mirror it:
+1. **Trend on:** a bar closes back above the EMA and VWAP after being below (the reclaim). The low of that move is the floor.
+2. **Entry:** from the **first** pullback into the EMA. *On reclaim* (default): at market on the close of the bar that bounces back over the EMA, unless it closed more than *Reclaim max chase* (8 pts) away. *Limit at EMA*: a buy limit resting at EMA + *Pullback offset*.
+3. **Higher lows:** when a pullback leaves the EMA zone, its low becomes the new floor. The next entry needs the next pullback, up to *max entries per leg* (default 2).
+4. **Break and reclaim allowed:** a pullback may close through the EMA by up to 5 pts, up to 2 closes in a row.
+5. **Trend off:** a deeper close through the EMA or VWAP, 3 closes through the EMA, a lower low, or a stop-out in that leg.
+
+The chart marks a reclaim with a gold **T** and each higher low with a gold triangle. trades.csv tags every trade `rejection`, `trend` or `forced` (column *setup*), so the modes can be compared.
+
 ### Order management
 
 | | Behaviour |

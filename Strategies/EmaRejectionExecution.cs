@@ -18,6 +18,8 @@ using NinjaTrader.NinjaScript.DrawingTools;
 namespace NinjaTrader.NinjaScript.Strategies
 {
     public enum EmaRejDirection { Both, LongOnly, ShortOnly }
+    public enum EmaRejSetupMode { Rejection, TrendPullback, Either }
+    public enum EmaRejPullbackEntry { OnReclaim, LimitAtEma }
 
     // EMA rejection / bounce execution.
     // Short: price tests EMA from below (wick can pierce, close can be a tick or two over), then closes back under.
@@ -25,6 +27,8 @@ namespace NinjaTrader.NinjaScript.Strategies
     // Long:  mirror (bounces off EMA from above making higher lows, buy limit rides EMA plus offset).
     // Stop = fixed points, target = beyond the most recent swing low (short) / swing high (long).
     // AUTO button arms it; it stays armed and takes every new setup until a full stop-loss hit or you click it off.
+    // Trend pullback (Setup mode): price closes back over EMA and VWAP (the reclaim), then each pullback into the EMA that
+    // holds a higher low (short: lower high) is an entry, from the first bounce.
     public class EmaRejectionExecution : Strategy
     {
         private const string SigLong  = "EMAR_L";
@@ -48,8 +52,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             public int ForcedBar;
             public int ForcedAnchor = -1;
             public string Status = "";
+            // Trend pullback: kept through Reset (a trade or a broken rejection count doesn't end the trend)
+            public bool TrendOn;
+            public bool TrendArmed = true;                    // a new trend needs a fresh reclaim: price on the other side first
+            public int TrendAnchor = -1;                      // the reclaim bar: where the target leg starts
+            public int TrendBar = -1;                         // the reclaim or the newest higher low
+            public double TrendFloor;                         // newest higher low (short: lower high); a break ends the trend
+            public int TrendEntries;
+            public bool TrendWaitPb;                          // traded this pullback: the next entry needs the next one
+            public int CloseThrough;                          // consecutive closes through the EMA
+            public bool PbActive, PbTriggered;
+            public double PbExtreme;
+            public int PbBar, TriggerBar = -1;                // TriggerBar: the bar that bounced back over the EMA
 
-            public int LastBar { get { return Forced ? ForcedBar : (ExtremeBars.Count > 0 ? ExtremeBars[ExtremeBars.Count - 1] : -1); } }
+            public int LastBar
+            {
+                get
+                {
+                    if (Forced) return ForcedBar;
+                    int last = ExtremeBars.Count > 0 ? ExtremeBars[ExtremeBars.Count - 1] : -1;
+                    return TrendOn ? Math.Max(last, TrendBar) : last;
+                }
+            }
 
             public void Reset(bool leftZone)
             {
@@ -129,6 +153,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double planEntry, planStop, planTarget;
         private bool planFallback;
         private bool planTooClose;
+        private bool planViaTrend;   // the plan comes from the trend pullback (not a rejection count or a button)
+        private string tradeSetup = "";
         private double planLeg = double.NaN;
         private int planAnchor = -1;
 
@@ -224,6 +250,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UseSlopeFilter          = false;
                 SlopeBars               = 10;
                 SwingStrength           = 3;
+                SetupMode               = EmaRejSetupMode.Either;
+                TrendNeedsVwap          = true;
+                TrendBreakPts           = 5;
+                TrendBreakBars          = 3;
+                TrendMaxEntries         = 2;
+                PullbackEntry           = EmaRejPullbackEntry.OnReclaim;
+                PullbackOffsetPts       = 2;
+                ReclaimMaxChasePts      = 8;
 
                 LongOffsetPts           = 5;
                 ShortOffsetPts          = 5;
@@ -686,8 +720,138 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (isLow)  { lastSwingLow  = Low[p];  hasSwingLow  = true; lastSwingLowBar  = CurrentBar - p; }
         }
 
+        // Trend pullback. On: a close back over the EMA (and VWAP) after being on the other side; the floor is the low of
+        // the move that reclaimed. Each pullback into the EMA touch zone that bounces (closes RejectClose over the EMA) is a
+        // trigger; when it leaves the zone its low is the new higher low. Off: a close more than TrendBreakPts through the
+        // EMA (or VWAP), TrendBreakBars closes in a row through the EMA, a lower low, or a stop-out in this leg.
+        private void UpdateTrend(SideState s, int c)
+        {
+            if (SetupMode == EmaRejSetupMode.Rejection || lastVwap <= 0)
+                return;
+            double eps  = TickSize * 0.01;
+            double e    = ema[c];
+            int cb      = CurrentBar - c;
+            double ext  = s.Dir > 0 ? Low[c] : High[c];
+            string name = s.Dir > 0 ? "Long" : "Short";
+
+            if (!s.TrendOn)
+            {
+                bool onSide = s.Dir * (Close[c] - e) > eps && (!TrendNeedsVwap || s.Dir * (Close[c] - lastVwap) > eps);
+                if (!onSide)
+                {
+                    s.TrendArmed = true;
+                    return;
+                }
+                if (!s.TrendArmed)
+                    return;
+                // The reclaim. Floor: the low (short: high) back to the last close on this side of the EMA (max 30 bars)
+                double floor = ext;
+                int look = Math.Min(30, CurrentBar - c - 1);
+                for (int i = c + 1; i <= c + look; i++)
+                {
+                    floor = s.Dir > 0 ? Math.Min(floor, Low[i]) : Math.Max(floor, High[i]);
+                    if (s.Dir * (Close[i] - ema[i]) > eps)
+                        break;
+                }
+                s.TrendOn      = true;
+                s.TrendArmed   = false;
+                s.TrendAnchor  = s.TrendBar = cb;
+                s.TrendFloor   = floor;
+                s.TrendEntries = 0;
+                s.TrendWaitPb  = s.PbActive = s.PbTriggered = false;
+                s.CloseThrough = 0;
+                s.TriggerBar   = -1;
+                Log0(name + " trend on: reclaimed EMA" + (TrendNeedsVwap ? " + VWAP" : "") + ", " + (s.Dir > 0 ? "low " : "high ") + Fmt(floor));
+                if (ShowMarkers)
+                    Draw.Text(this, "EMAR_TO" + cb, "T", c, s.Dir > 0 ? Low[c] - 8 * TickSize : High[c] + 8 * TickSize, Brushes.Gold);
+                return;
+            }
+
+            double through = -s.Dir * (Close[c] - e);   // > 0: closed on the wrong side of the EMA
+            s.CloseThrough = through > eps ? s.CloseThrough + 1 : 0;
+            string off = "";
+            if (TrendNeedsVwap && -s.Dir * (Close[c] - lastVwap) > TrendBreakPts + eps)
+                off = "closed more than " + TrendBreakPts.ToString("0.##") + " pts through VWAP";
+            else if (through > TrendBreakPts + eps)
+                off = "closed " + through.ToString("0.##") + " pts through EMA";
+            else if (TrendBreakBars > 0 && s.CloseThrough >= TrendBreakBars)
+                off = s.CloseThrough + " closes through EMA";
+            else if (s.Dir * (ext - s.TrendFloor) < -eps)
+                off = s.Dir > 0 ? "lower low" : "higher high";
+            if (off.Length > 0)
+            {
+                EndTrend(s, off);
+                return;
+            }
+
+            // Pullbacks into the EMA zone
+            if (-s.Dir * (ext - e) >= -TouchZonePts - eps)
+            {
+                if (!s.PbActive)
+                {
+                    s.PbActive    = true;
+                    s.PbTriggered = false;
+                    s.PbExtreme   = ext;
+                    s.PbBar       = cb;
+                }
+                else if (s.Dir * (ext - s.PbExtreme) < 0)
+                {
+                    s.PbExtreme = ext;
+                    s.PbBar     = cb;
+                }
+                // The bounce: a close back over the EMA (once per pullback)
+                if (!s.PbTriggered && s.Dir * (Close[c] - e) >= RejectCloseTicks * TickSize - eps)
+                {
+                    s.PbTriggered = true;
+                    s.TriggerBar  = cb;
+                    Log0(name + " pullback bounced off EMA, " + (s.Dir > 0 ? "low " : "high ") + Fmt(s.PbExtreme));
+                }
+            }
+            else if (s.PbActive)
+            {
+                // Left the zone: that pullback's extreme is the new higher low (short: lower high)
+                s.PbActive    = false;
+                s.TrendFloor  = s.PbExtreme;
+                s.TrendBar    = s.PbBar;
+                s.TrendWaitPb = false;
+                if (ShowMarkers)
+                {
+                    int ago = CurrentBar - s.PbBar;
+                    if (s.Dir > 0)
+                        Draw.TriangleUp(this, "EMAR_TH" + s.PbBar, false, ago, s.PbExtreme - 2 * TickSize, Brushes.Gold);
+                    else
+                        Draw.TriangleDown(this, "EMAR_TH" + s.PbBar, false, ago, s.PbExtreme + 2 * TickSize, Brushes.Gold);
+                }
+            }
+        }
+
+        private void EndTrend(SideState s, string why)
+        {
+            s.TrendOn = s.TrendArmed = s.PbActive = false;
+            s.TriggerBar = -1;
+            Log0((s.Dir > 0 ? "Long" : "Short") + " trend off: " + why);
+        }
+
+        // An entry can come from the rejection count or from the trend pullback (Setup mode)
+        private bool RejectionReady(SideState s)
+        {
+            return SetupMode != EmaRejSetupMode.TrendPullback && s.Extremes.Count >= RequiredRejections;
+        }
+
+        private bool TrendReady(SideState s)
+        {
+            return SetupMode != EmaRejSetupMode.Rejection && s.TrendOn && !s.TrendWaitPb
+                && (TrendMaxEntries <= 0 || s.TrendEntries < TrendMaxEntries);
+        }
+
+        private bool ViaTrend(SideState s)
+        {
+            return !s.Forced && !RejectionReady(s) && TrendReady(s);
+        }
+
         private void UpdateSide(SideState s, int c)
         {
+            UpdateTrend(s, c);
             double eps = TickSize * 0.01;
             double e = ema[c];
             int cb = CurrentBar - c;
@@ -751,8 +915,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            int n = s.Extremes.Count;
-            s.Status = s.Forced ? "FORCED" : (n >= RequiredRejections ? "CONFIRMED" : (s.TestActive ? "testing" : ""));
+            s.Status = s.Forced ? "FORCED" : (RejectionReady(s) ? "CONFIRMED" : (s.TestActive ? "testing" : ""));
         }
 
         private void ConfirmRejection(SideState s, int cb)
@@ -804,9 +967,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void Invalidate(SideState s, string reason)
         {
-            bool had = s.Extremes.Count >= RequiredRejections || s.Forced;
+            bool had = RejectionReady(s) || s.Forced;
             s.Reset(false);
-            if (entryOrder != null && entryDir == s.Dir)
+            // A trend pullback entry stays: the trend has its own break rules
+            if (entryOrder != null && entryDir == s.Dir && !TrendReady(s))
                 CancelEntry();
             if (had)
                 Log0((s.Dir < 0 ? "Short" : "Long") + " setup cancelled: " + reason);
@@ -837,7 +1001,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (Direction == EmaRejDirection.ShortOnly && s.Dir > 0) continue;
                 if (!s.Forced)
                 {
-                    if (s.Extremes.Count < RequiredRejections) continue;
+                    if (!RejectionReady(s) && !TrendReady(s)) continue;
                     if (UseSlopeFilter && s.Dir * (ema[c] - ema[c + SlopeBars]) <= 0) continue;
                 }
                 if (FilterReason(s).Length > 0)
@@ -860,7 +1024,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return "";
             if (UseChopFilter && inChop)
                 return "chop";
-            if (TradeWithTrend && trendDir != s.Dir)
+            // The trend pullback has its own trend rules (a brief close through the EMA is part of it)
+            if (TradeWithTrend && trendDir != s.Dir && !ViaTrend(s))
                 return "trend not " + (s.Dir < 0 ? "bearish" : "bullish");
             return "";
         }
@@ -874,8 +1039,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             double e = ema[c];
             double target;
-            double entry = Rnd(s.Dir > 0 ? e + LongOffsetPts : e - ShortOffsetPts);
-            if (!TrackEma && entryOrder != null && entryDir == s.Dir)
+            planViaTrend = ViaTrend(s);
+            double entry = Rnd(e + s.Dir * PlanOffset(s.Dir));
+            if (planViaTrend && PullbackEntry == EmaRejPullbackEntry.OnReclaim)
+                entry = Rnd(Close[c]);   // at market on the bounce close
+            else if (!TrackEma && entryOrder != null && entryDir == s.Dir)
                 entry = entryOrder.LimitPrice;
 
             // Target = the leg's lower low (short) / higher high (long) + buffer; Minimum target is only a floor
@@ -893,10 +1061,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             return true;
         }
 
+        private double PlanOffset(int dir)
+        {
+            return planViaTrend ? PullbackOffsetPts : dir > 0 ? LongOffsetPts : ShortOffsetPts;
+        }
+
         // Where the target leg starts: the setup's first rejection; a forced setup uses the top (short) / bottom (long)
-        // of the move, frozen when the button was clicked.
+        // of the move, frozen when the button was clicked; a trend pullback uses the reclaim bar.
         private int LegAnchor(SideState s)
         {
+            if (planViaTrend)
+                return s.TrendAnchor;
             if (s.ExtremeBars.Count > 0)
                 return s.ExtremeBars[0];
             if (s.Forced)
@@ -1064,6 +1239,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            // Trend pullback "On reclaim": no resting limit; at market on the close of the bar that bounced back over the EMA
+            if (planViaTrend && PullbackEntry == EmaRejPullbackEntry.OnReclaim)
+            {
+                planTooClose = false;
+                if (entryOrder != null)
+                {
+                    if (entryOrder.OrderType == OrderType.Limit)
+                        CancelEntry();
+                    return;
+                }
+                if (s.TriggerBar != cb)
+                    return;
+                s.TriggerBar = -1;
+                double chase = s.Dir * (Close[c] - ema[c]);
+                if (chase > ReclaimMaxChasePts + execTick * 0.01)
+                {
+                    Log0((s.Dir > 0 ? "BUY" : "SELL") + " skipped: bounce closed " + chase.ToString("0.##") + " pts from EMA (max "
+                        + ReclaimMaxChasePts.ToString("0.##") + ")");
+                    return;
+                }
+                SubmitEntry(s, cb, true);
+                return;
+            }
+
             // The limit must rest at least MinDistFromPricePts away from the execution instrument's market,
             // waiting for price to come back to the EMA. Closer than that = wait (new) or leave it where it is (working).
             double bid = State == State.Realtime ? GetCurrentBid(execIdx) : Closes[execIdx][0];
@@ -1075,9 +1274,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (entryOrder == null)
             {
                 if (farEnough)
-                    SubmitEntry(s, cb);
+                    SubmitEntry(s, cb, false);
                 return;
             }
+            if (entryOrder.OrderType != OrderType.Limit)
+                return;   // a market entry on its way
 
             if (OrderExpiryBars > 0 && cb - entrySubmitBar >= OrderExpiryBars)
             {
@@ -1170,7 +1371,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private const string JournalHeader = "date,open_et,close_et,account,instrument,side,contracts,entry,stop_initial,tp_initial,"
             + "stop_final,tp_final,exit,points,pnl_usd,commission_usd,r,mae_pts,mfe_pts,exit_reason,trend,chop,forced,grade,cost_estimated,"
-            + "session,tf15_trend,value_loc,nearest_level,level_dist_pts";
+            + "session,tf15_trend,value_loc,nearest_level,level_dist_pts,setup";
 
         // One row per trade in Documents\NinjaTrader 8\analysis\trades.csv, for the strategy-analyst and risk-manager
         private string JournalRow(double entryPx, double exitPx, double pts, double pnl)
@@ -1187,7 +1388,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Num(pts), Num(pnl), Num(tradeCommission), Num(StopLossPts > 0 ? pts / StopLossPts : 0), Num(mae), Num(mfe),
                 exitReason.Replace(",", " "), tradeTrend > 0 ? "bull" : tradeTrend < 0 ? "bear" : "mixed",
                 tradeChop ? "chop" : "", tradeForced ? "forced" : "", "", costEstimated ? "1" : "",
-                ctxSession, ctxTf15, ctxValue, ctxLevel, ctxLevel.Length > 0 ? Num(ctxDist) : ""
+                ctxSession, ctxTf15, ctxValue, ctxLevel, ctxLevel.Length > 0 ? Num(ctxDist) : "", tradeSetup
             });
         }
 
@@ -1274,7 +1475,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return (x < 0 ? "-$" : "$") + Math.Abs(x).ToString("0");
         }
 
-        private void SubmitEntry(SideState s, int cb)
+        private void SubmitEntry(SideState s, int cb, bool atMarket)
         {
             string sig = s.Dir > 0 ? SigLong : SigShort;
             int stopTicks = Math.Max(1, (int)Math.Round(StopLossPts / execTick));
@@ -1285,14 +1486,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             SetTarget(sig, planTarget);
 
             entryCancelRequested = false;
-            Order o = s.Dir > 0
-                ? EnterLongLimit(execIdx, true, Contracts, planEntry, sig)
-                : EnterShortLimit(execIdx, true, Contracts, planEntry, sig);
+            Order o = atMarket
+                ? (s.Dir > 0 ? EnterLong(execIdx, Contracts, sig) : EnterShort(execIdx, Contracts, sig))
+                : s.Dir > 0
+                    ? EnterLongLimit(execIdx, true, Contracts, planEntry, sig)
+                    : EnterShortLimit(execIdx, true, Contracts, planEntry, sig);
             if (o == null)
             {
                 // NinjaTrader ignored it (its order handling rules); turn on "Trace orders" to see why in the Output window
                 if (!entryIgnoredLogged)
-                    Log0((s.Dir > 0 ? "BUY" : "SELL") + " LMT ignored by NinjaTrader (see Output with Trace orders on)");
+                    Log0((s.Dir > 0 ? "BUY" : "SELL") + (atMarket ? " MKT" : " LMT") + " ignored by NinjaTrader (see Output with Trace orders on)");
                 entryIgnoredLogged = true;
                 return;
             }
@@ -1302,7 +1505,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             entryDir       = s.Dir;
             entrySignal    = sig;
             entrySubmitBar = cb;
-            Log0((s.Dir > 0 ? "BUY" : "SELL") + " LMT " + Fmt(planEntry) + " sent"
+            Log0((s.Dir > 0 ? "BUY" : "SELL") + (atMarket ? " MKT (trend pullback bounce, close " + Fmt(planEntry) + ")" : " LMT " + Fmt(planEntry))
+                + " sent" + (planViaTrend ? " [trend " + (s.TrendEntries + 1) + "/" + (TrendMaxEntries > 0 ? TrendMaxEntries.ToString() : "-") + "]" : "")
                 + (splitActive ? " (" + (Contracts / 2) + " at TP1 " + Fmt(tp1Price) + ", " + (Contracts - Contracts / 2) + " runner)" : ""));
         }
 
@@ -1547,6 +1751,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Setup is used up: a new one has to form after this trade
                 SideState s = activeSignal == SigLong ? longSide : shortSide;
                 tradeForced = s.Forced;
+                tradeSetup  = s.Forced ? "forced" : planViaTrend ? "trend" : "rejection";
+                if (s.TrendOn)
+                {
+                    s.TrendEntries++;
+                    s.TrendWaitPb = true;   // the next trend entry needs the next pullback
+                }
                 s.Reset(false);
             }
             else if ((o.Name == "Stop loss" || o.Name == "Stop put-back") && o.OrderState == OrderState.Filled && !stopHandled)
@@ -1563,6 +1773,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Log0("STOPPED OUT");
                     if (DisarmOnStopLoss) pendingDisarm = "stop loss";
+                    // A full stop-out means the higher-low idea failed: that trend leg is done
+                    SideState ts = activeSignal == SigLong ? longSide : shortSide;
+                    if (ts.TrendOn)
+                        EndTrend(ts, "stopped out");
                 }
             }
             else if (o.Name == Tp1Name && o.OrderState == OrderState.Filled)
@@ -1722,7 +1936,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 string first;
                                 using (System.IO.StreamReader r = new System.IO.StreamReader(w.Path))
                                     first = r.ReadLine();
-                                if (first != null && first.Trim().TrimStart('﻿') != w.Header)
+                                string old = first == null ? null : first.Trim().TrimStart('﻿');
+                                if (old != null && old.Length > 0 && old != w.Header && w.Header.StartsWith(old + ","))
+                                {
+                                    // Columns added at the end: the old rows get empty ones, the journal stays one file
+                                    string pad = new string(',', w.Header.Substring(old.Length).Split(',').Length - 1);
+                                    string[] lines = System.IO.File.ReadAllLines(w.Path);
+                                    lines[0] = w.Header;
+                                    for (int i = 1; i < lines.Length; i++)
+                                        if (lines[i].Length > 0)
+                                            lines[i] += pad;
+                                    System.IO.File.WriteAllLines(w.Path, lines);
+                                }
+                                else if (old != null && old != w.Header)
                                     System.IO.File.Move(w.Path, System.IO.Path.ChangeExtension(w.Path, null)
                                         + "." + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
                             }
@@ -1774,7 +2000,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 list += (list.Length > 0 ? " > " : "") + Fmt(x);
             if (s.Dir > 0 && list.Length > 0)
                 list = list.Replace(" > ", " < ");
-            return label + s.Extremes.Count + "/" + RequiredRejections + (s.Status.Length > 0 ? " " + s.Status : "") + (list.Length > 0 ? "  " + list : "");
+            string trend = SetupMode == EmaRejSetupMode.Rejection ? ""
+                : s.TrendOn ? "  | TREND " + (s.Dir > 0 ? "HL " : "LH ") + Fmt(s.TrendFloor) + " " + s.TrendEntries + "/"
+                              + (TrendMaxEntries > 0 ? TrendMaxEntries.ToString() : "-") + (s.TrendWaitPb ? " (next pullback)" : "")
+                : "  | trend off";
+            return label + s.Extremes.Count + "/" + RequiredRejections + (s.Status.Length > 0 ? " " + s.Status : "") + (list.Length > 0 ? "  " + list : "") + trend;
         }
 
         private string BuildDashboardText()
@@ -1803,9 +2033,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 double risk = Math.Abs(planEntry - planStop);
                 double reward = Math.Abs(planTarget - planEntry);
-                double offset = planDir > 0 ? LongOffsetPts : ShortOffsetPts;
-                t += "Plan " + (planDir > 0 ? "BUY" : "SELL") + " LMT " + Fmt(planEntry)
-                    + "  (EMA " + Fmt(planEma) + (planDir > 0 ? " + " : " - ") + offset.ToString("0.##") + ")\n";
+                double offset = PlanOffset(planDir);
+                bool onReclaim = planViaTrend && PullbackEntry == EmaRejPullbackEntry.OnReclaim;
+                t += "Plan " + (planDir > 0 ? "BUY" : "SELL") + (onReclaim ? " MKT on the next bounce over EMA " + Fmt(planEma)
+                    : " LMT " + Fmt(planEntry) + "  (EMA " + Fmt(planEma) + (planDir > 0 ? " + " : " - ") + offset.ToString("0.##") + ")")
+                    + (planViaTrend ? " [trend]" : "") + "\n";
                 string legName = planDir < 0 ? "LL " : "HH ";
                 t += "  SL " + Fmt(planStop) + "  TP " + Fmt(planTarget)
                     + (planFallback ? " (min " + (StopLossPts * MinTargetR).ToString("0.##") +(double.IsNaN(planLeg) ? ", no leg)" : ", " + legName + Fmt(planLeg) + " too close)") : " (" + legName + Fmt(planLeg) + ")")
@@ -2104,6 +2336,29 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int SwingStrength { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name = "Setup mode", Description = "Rejection: N confirmed rejections / bounces (the original rule). Trend pullback: after price closes back over the EMA (and VWAP), each pullback into the EMA holding a higher low (short: lower high) is an entry, from the first bounce. Either: both.", Order = 15, GroupName = "1. Setup")]
+        public EmaRejSetupMode SetupMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trend: needs VWAP", Description = "The reclaim must close over VWAP as well as the EMA, and a close more than 'Trend: max close through' through VWAP ends the trend.", Order = 16, GroupName = "1. Setup")]
+        public bool TrendNeedsVwap { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Trend: max close through EMA (pts)", Description = "A pullback may close through the EMA by up to this much (break and reclaim). Further ends the trend.", Order = 17, GroupName = "1. Setup")]
+        public double TrendBreakPts { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Trend: closes through EMA to end it", Description = "This many closes in a row through the EMA end the trend. 0 = off.", Order = 18, GroupName = "1. Setup")]
+        public int TrendBreakBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Trend: max entries per leg", Description = "Pullback entries per trend leg (0 = no limit). A stop-out also ends the leg.", Order = 19, GroupName = "1. Setup")]
+        public int TrendMaxEntries { get; set; }
+
+        [NinjaScriptProperty]
         [Range(-50, 50)]
         [Display(Name = "Long offset (pts)", Description = "Buy limit = EMA + this. Positive fills just above the EMA, negative needs a poke through.", Order = 1, GroupName = "2. Entry")]
         public double LongOffsetPts { get; set; }
@@ -2126,6 +2381,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0, double.MaxValue)]
         [Display(Name = "Min distance from price (pts)", Description = "The limit is only placed / moved when it rests at least this far from the market (bid/ask of the execution instrument). Stops it landing right on price.", Order = 6, GroupName = "2. Entry")]
         public double MinDistFromPricePts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trend pullback entry", Description = "On reclaim: at market on the close of the bar that bounces back over the EMA. Limit at EMA: a limit resting at EMA +/- Pullback offset while price is away.", Order = 7, GroupName = "2. Entry")]
+        public EmaRejPullbackEntry PullbackEntry { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(-50, 50)]
+        [Display(Name = "Pullback offset (pts)", Description = "Trend pullback 'Limit at EMA': buy limit = EMA + this, sell limit = EMA - this.", Order = 8, GroupName = "2. Entry")]
+        public double PullbackOffsetPts { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Reclaim max chase (pts)", Description = "Trend pullback 'On reclaim': no entry when the bounce bar closes further than this from the EMA.", Order = 9, GroupName = "2. Entry")]
+        public double ReclaimMaxChasePts { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Direction", Order = 5, GroupName = "2. Entry")]
