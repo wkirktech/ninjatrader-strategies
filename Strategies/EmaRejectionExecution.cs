@@ -62,6 +62,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             public bool TrendWaitPb;                          // traded this pullback: the next entry needs the next one
             public int CloseThrough;                          // consecutive closes through the EMA
             public bool PbActive, PbTriggered;
+            public bool PbLeft;                               // price was clear of the EMA zone since the reclaim / last pullback
             public double PbExtreme;
             public int PbBar, TriggerBar = -1;                // TriggerBar: the bar that bounced back over the EMA
 
@@ -462,6 +463,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 sessLow  = onLow  = double.MaxValue;
                 vwapSession  = session;
                 vwapStartBar = CurrentBar - c;
+                // A trend doesn't carry into a new session: VWAP starts over, so a fresh reclaim is needed
+                foreach (SideState s in new[] { longSide, shortSide })
+                    if (s.TrendOn)
+                        EndTrend(s, "new session");
                 vwapPV  = 0;
                 vwapVol = 0;
             }
@@ -744,13 +749,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 if (!s.TrendArmed)
                     return;
-                // The reclaim. Floor: the low (short: high) back to the last close on this side of the EMA (max 30 bars)
+                // The reclaim. Floor: the low (short: high) back to the last bar that closed fully on this side (max 30 bars)
                 double floor = ext;
                 int look = Math.Min(30, CurrentBar - c - 1);
                 for (int i = c + 1; i <= c + look; i++)
                 {
                     floor = s.Dir > 0 ? Math.Min(floor, Low[i]) : Math.Max(floor, High[i]);
-                    if (s.Dir * (Close[i] - ema[i]) > eps)
+                    bool vwapSide = !TrendNeedsVwap || (Values[0].IsValidDataPoint(i) && s.Dir * (Close[i] - Values[0][i]) > eps);
+                    if (s.Dir * (Close[i] - ema[i]) > eps && vwapSide)
                         break;
                 }
                 s.TrendOn      = true;
@@ -758,7 +764,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 s.TrendAnchor  = s.TrendBar = cb;
                 s.TrendFloor   = floor;
                 s.TrendEntries = 0;
-                s.TrendWaitPb  = s.PbActive = s.PbTriggered = false;
+                s.TrendWaitPb  = s.PbActive = s.PbTriggered = s.PbLeft = false;
                 s.CloseThrough = 0;
                 s.TriggerBar   = -1;
                 Log0(name + " trend on: reclaimed EMA" + (TrendNeedsVwap ? " + VWAP" : "") + ", " + (s.Dir > 0 ? "low " : "high ") + Fmt(floor));
@@ -784,8 +790,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // Pullbacks into the EMA zone
-            if (-s.Dir * (ext - e) >= -TouchZonePts - eps)
+            // Pullbacks into the EMA zone. One starts only after price was clear of the zone (not the bars right after the reclaim).
+            bool inZone = -s.Dir * (ext - e) >= -TouchZonePts - eps;
+            if (!inZone)
+                s.PbLeft = true;
+            if (inZone && (s.PbActive || s.PbLeft))
             {
                 if (!s.PbActive)
                 {
@@ -811,6 +820,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // Left the zone: that pullback's extreme is the new higher low (short: lower high)
                 s.PbActive    = false;
+                s.PbLeft      = true;
                 s.TrendFloor  = s.PbExtreme;
                 s.TrendBar    = s.PbBar;
                 s.TrendWaitPb = false;
@@ -1283,6 +1293,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (OrderExpiryBars > 0 && cb - entrySubmitBar >= OrderExpiryBars)
             {
                 Invalidate(s, "limit expired");
+                CancelEntry();   // a trend limit too (Invalidate leaves it to the trend rules)
                 return;
             }
 
@@ -1752,7 +1763,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SideState s = activeSignal == SigLong ? longSide : shortSide;
                 tradeForced = s.Forced;
                 tradeSetup  = s.Forced ? "forced" : planViaTrend ? "trend" : "rejection";
-                if (s.TrendOn)
+                if (s.TrendOn && planViaTrend && !s.Forced)
                 {
                     s.TrendEntries++;
                     s.TrendWaitPb = true;   // the next trend entry needs the next pullback
@@ -1946,7 +1957,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     for (int i = 1; i < lines.Length; i++)
                                         if (lines[i].Length > 0)
                                             lines[i] += pad;
-                                    System.IO.File.WriteAllLines(w.Path, lines);
+                                    System.IO.File.WriteAllLines(w.Path + ".tmp", lines);   // swapped in whole: a crash never leaves half a journal
+                                    System.IO.File.Replace(w.Path + ".tmp", w.Path, null);
                                 }
                                 else if (old != null && old != w.Header)
                                     System.IO.File.Move(w.Path, System.IO.Path.ChangeExtension(w.Path, null)
