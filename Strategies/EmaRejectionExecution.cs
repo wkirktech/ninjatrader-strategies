@@ -32,7 +32,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Split targets: one entry; once price reaches TP1 the strategy sends a market exit for half from OnBarUpdate.
         // (The old two-entry split with per-entry stops was in every NinjaTrader lock-up: 2026-10-26 21:56, 22:17, 2026-10-27 07:33.)
         private const string Tp1Name = "TP1";
-        private const int Tp1MinGapTicks = 8;   // TP1 must sit this far inside the target, or the target takes the whole position
 
         private class SideState
         {
@@ -152,6 +151,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Split targets: half exits at market at TP1 (Tp1R from the fill), the runner keeps the leg target
         private bool splitActive, tp1Sent, tp1Done, stopHandled;
         private double tp1Price;
+        private int tp1Qty;
+        private Order tp1Order;   // the TP1 market exit, until it is done (FLAT must not exit those contracts twice)
         private string tp1Note = "";
         private bool cancelLeftover;
         private Order leftoverEntry;   // entry order still open when a trade went flat
@@ -270,6 +271,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TraceOrdersToOutput     = false;
                 Tp1R                    = 1;
                 RunnerToBreakeven       = true;
+                Tp1MinGapPts            = 5;
 
                 AddPlot(Brushes.Orange, "VWAP");
             }
@@ -976,21 +978,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;   // only part of the entry filled so far: wait for more, or the target takes it all
             bool isLong = p.MarketPosition == MarketPosition.Long;
             int dir = isLong ? 1 : -1;
-            double px = State == State.Realtime ? (isLong ? GetCurrentBid(execIdx) : GetCurrentAsk(execIdx))
-                                                : (isLong ? Highs[execIdx][0] : Lows[execIdx][0]);
+            // History: the close (a bar's high / low may come from before the fill, and the exit fills on the next open)
+            double px = State == State.Realtime ? (isLong ? GetCurrentBid(execIdx) : GetCurrentAsk(execIdx)) : Closes[execIdx][0];
             if (dir * (px - tp1Price) < -execTick * 0.01)
                 return;
 
             tp1Sent = true;
             // Target at (or next to) TP1: a market exit racing the target could overfill, so the target takes the whole position
-            if (dir * (lastSetTarget - tp1Price) < Tp1MinGapTicks * execTick - execTick * 0.01)
+            if (dir * (lastSetTarget - tp1Price) < Tp1MinGapPts - execTick * 0.01)
             {
-                tp1Note = "skipped, TP at TP1";
-                Log0("TP1 skipped: target " + Fmt(lastSetTarget) + " is within " + Tp1MinGapTicks + " ticks of TP1");
+                tp1Note = "skipped, TP near TP1";
+                Log0("TP1 skipped: target " + Fmt(lastSetTarget) + " is within " + Tp1MinGapPts.ToString("0.##") + " pts of TP1");
                 return;
             }
             Order o = isLong ? ExitLong(execIdx, qty, Tp1Name, activeSignal) : ExitShort(execIdx, qty, Tp1Name, activeSignal);
-            tp1Note = o == null ? "ignored by NinjaTrader" : "sent";
+            tp1Order = o;
+            tp1Qty   = qty;
+            tp1Note  = o == null ? "ignored by NinjaTrader" : "sent";
             Log0(o == null ? "TP1 exit ignored by NinjaTrader (see Output with Trace orders on)"
                            : "TP1 reached " + Fmt(tp1Price) + ": " + (isLong ? "selling " : "buying ") + qty + " at market");
         }
@@ -1000,12 +1004,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             SetStopLoss(activeSignal, CalculationMode.Price, price, false);
         }
 
-        // Market exit of the whole position
+        // Market exit of the whole position, less what a TP1 exit still in flight takes out
         private void ExitAll(string name)
         {
             Position p = Positions[execIdx];
-            if (p.MarketPosition == MarketPosition.Long) ExitLong(execIdx, p.Quantity, name, "");
-            else                                          ExitShort(execIdx, p.Quantity, name, "");
+            int qty = p.Quantity;
+            if (tp1Order != null && !Order.IsTerminalState(tp1Order.OrderState))
+                qty -= tp1Order.Quantity - tp1Order.Filled;
+            if (qty <= 0)
+                return;
+            if (p.MarketPosition == MarketPosition.Long) ExitLong(execIdx, qty, name, "");
+            else                                          ExitShort(execIdx, qty, name, "");
         }
 
         private static bool IsEntrySignal(string name)
@@ -1517,6 +1526,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 int fdir = activeSignal == SigLong ? 1 : -1;
                 tp1Sent     = tp1Done = stopHandled = false;
                 tp1Note     = "";
+                tp1Order    = null;
                 bePending   = false;
                 // TP re-set from the fill, TP1, trade context and the fill log line: next update (ProcessPending)
                 fillPending = true;
@@ -1784,7 +1794,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + (profitLocked ? "  LOCKED +" + ProfitLockPts : (UseProfitLock ? "  lock @+" + ProfitLockTriggerPts : "")) + "\n";
                 string tradeLegName = p.MarketPosition == MarketPosition.Short ? "LL " : "HH ";
                 if (splitActive)
-                    t += "  TP1 " + Fmt(tp1Price) + " (" + Tp1R.ToString("0.##") + "R, " + (Contracts / 2) + " at market)"
+                    t += "  TP1 " + Fmt(tp1Price) + " (" + Tp1R.ToString("0.##") + "R, " + (tp1Sent && tp1Qty > 0 ? tp1Qty : Contracts / 2) + " at market)"
                         + (tp1Note.Length > 0 ? " " + tp1Note : "") + (tp1Done && RunnerToBreakeven ? ", runner at BE" : "") + "\n";
                 t += (splitActive ? "  TP2 " : "  TP ") + Fmt(lastSetTarget) + (targetManual ? " (manual)"
                     : double.IsNaN(tradeLeg) ? " (min)" : " (" + tradeLegName + Fmt(tradeLeg) + ")") + "\n";
@@ -2151,13 +2161,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double ProfitLockPts { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Split targets (2+ contracts)", Description = "One entry. When price reaches TP1 (gold dashed line), the strategy sends a market exit for half the contracts; the rest (the runner, which gets the extra contract on odd counts) keeps the leg target and the stop. TP1 is set here, not dragged, and needs NinjaTrader running. Skipped for a trade whose target is within 2 pts of TP1. No effect with 1 contract.", Order = 9, GroupName = "3. Exits")]
+        [Display(Name = "Split targets (2+ contracts)", Description = "One entry. When price reaches TP1 (gold dashed line), the strategy sends a market exit for half the contracts; the rest (the runner, which gets the extra contract on odd counts) keeps the leg target and the stop. TP1 is set here, not dragged, and needs NinjaTrader running. Skipped for a trade whose target is within 'TP1 min gap to target' of TP1. No effect with 1 contract.", Order = 9, GroupName = "3. Exits")]
         public bool SplitTargets { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.25, 10)]
         [Display(Name = "TP1 at (x stop)", Description = "TP1 distance from the fill as a multiple of the stop (1 = 1:1). Below 1 needs a high hit rate to beat costs.", Order = 10, GroupName = "3. Exits")]
         public double Tp1R { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "TP1 min gap to target (pts)", Description = "TP1 is skipped for a trade whose target is closer than this to TP1: the target takes the whole position. A TP1 market exit racing a nearby target could overfill on a fast move.", Order = 12, GroupName = "3. Exits")]
+        public double Tp1MinGapPts { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Runner stop to breakeven after TP1", Description = "Once the TP1 exit fills, the runner's stop moves to the average entry (never loosened).", Order = 11, GroupName = "3. Exits")]
