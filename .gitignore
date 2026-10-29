@@ -14,3 +14,7 @@
 !/Strategies/
 /Strategies/*
 !/Strategies/EmaRejectionExecution.cs
+
+!/Indicators/
+/Indicators/*
+!/Indicators/TpoMarketProfile.cs
