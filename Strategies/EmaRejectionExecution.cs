@@ -210,8 +210,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // UI
         private ChartControl chartControlRef;
         private StackPanel uiPanel;
-        private TextBlock infoText, statusText;
-        private Button autoButton, dirButton, flatButton, buyButton, sellButton;
+        private TextBlock infoText, statusText, titleText;
+        private Button autoButton, dirButton, flatButton, buyButton, sellButton, collapseButton;
+        private Border uiBorder;
+        private StackPanel uiRow2;
+        private bool uiCollapsed;   // UI thread only
 
         protected override void OnStateChange()
         {
@@ -251,7 +254,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UseSlopeFilter          = false;
                 SlopeBars               = 10;
                 SwingStrength           = 3;
-                SetupMode               = EmaRejSetupMode.Either;
+                SetupMode               = EmaRejSetupMode.Rejection;
                 TrendNeedsVwap          = true;
                 TrendBreakPts           = 5;
                 TrendBreakBars          = 3;
@@ -290,6 +293,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ShowMarkers             = true;
                 ShowPlanLines           = true;
                 ShowDashboard           = true;
+                DashboardCollapsed      = false;
 
                 UseChopFilter           = true;
                 ChopLookbackBars        = 84;
@@ -2081,10 +2085,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             Brush statusBrush = inChop && UseChopFilter ? Brushes.Red : inChop || chopRisk ? Brushes.Yellow : trendDir > 0 ? Brushes.LimeGreen : trendDir < 0 ? Brushes.Orange : Brushes.Gray;
             bool isArmed  = armed;
             string dir    = Direction == EmaRejDirection.Both ? "BOTH" : Direction == EmaRejDirection.LongOnly ? "LONG" : "SHORT";
+            Position pos  = Positions[execIdx];
+            string posText = pos.MarketPosition == MarketPosition.Flat ? "FLAT"
+                : (pos.MarketPosition == MarketPosition.Long ? "LONG " : "SHORT ") + pos.Quantity;
             chartControlRef.Dispatcher.InvokeAsync(new Action(() =>
             {
                 if (infoText == null)
                     return;
+                titleText.Text = uiCollapsed ? "EMAR  " + posText : "EMA REJECTION EXEC";
                 infoText.Text = text;
                 statusText.Text       = status;
                 statusText.Foreground = statusBrush;
@@ -2135,8 +2143,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Padding         = new Thickness(8),
                 MinWidth        = 270
             };
+            uiBorder = border;
             StackPanel inner = new StackPanel();
-            inner.Children.Add(new TextBlock { Text = "EMA REJECTION EXEC", FontWeight = FontWeights.Bold, Foreground = Brushes.Gold, FontSize = 12 });
+            StackPanel header = new StackPanel { Orientation = Orientation.Horizontal };
+            collapseButton = MakeButton("\u25BE", 22, Brushes.Gainsboro);
+            collapseButton.Height = 20;
+            collapseButton.Margin = new Thickness(0, 0, 6, 0);
+            collapseButton.ToolTip = "Hide / show the dashboard details";
+            titleText = new TextBlock { Text = "EMA REJECTION EXEC", FontWeight = FontWeights.Bold, Foreground = Brushes.Gold, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+            header.Children.Add(collapseButton);
+            header.Children.Add(titleText);
+            inner.Children.Add(header);
             infoText = new TextBlock
             {
                 Foreground = Brushes.Gainsboro,
@@ -2165,6 +2182,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             row1.Children.Add(flatButton);
 
             StackPanel row2 = new StackPanel { Orientation = Orientation.Horizontal };
+            uiRow2 = row2;
             buyButton  = MakeButton("BUY @EMA", 90, Brushes.DeepSkyBlue);
             sellButton = MakeButton("SELL @EMA", 90, Brushes.OrangeRed);
             row2.Children.Add(buyButton);
@@ -2180,7 +2198,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             flatButton.Click += OnFlatClick;
             buyButton.Click  += OnBuyClick;
             sellButton.Click += OnSellClick;
+            collapseButton.Click += OnCollapseClick;
 
+            SetCollapsed(DashboardCollapsed);
             UserControlCollection.Add(uiPanel);
         }
 
@@ -2191,10 +2211,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (flatButton != null) flatButton.Click -= OnFlatClick;
             if (buyButton  != null) buyButton.Click  -= OnBuyClick;
             if (sellButton != null) sellButton.Click -= OnSellClick;
+            if (collapseButton != null) collapseButton.Click -= OnCollapseClick;
             if (uiPanel != null && UserControlCollection.Contains(uiPanel))
                 UserControlCollection.Remove(uiPanel);
             uiPanel = null;
             infoText = null;
+        }
+
+        // Collapsed: title (with the position) and the AUTO / direction / FLAT row only. Pure UI, no strategy state.
+        private void SetCollapsed(bool collapsed)
+        {
+            uiCollapsed = collapsed;
+            Visibility v = collapsed ? Visibility.Collapsed : Visibility.Visible;
+            statusText.Visibility = v;
+            infoText.Visibility   = v;
+            uiRow2.Visibility     = v;
+            uiBorder.MinWidth     = collapsed ? 0 : 270;
+            collapseButton.Content = collapsed ? "\u25B8" : "\u25BE";
+            titleText.Text        = collapsed ? "EMAR" : "EMA REJECTION EXEC";   // the position follows on the next refresh
+        }
+
+        private void OnCollapseClick(object sender, RoutedEventArgs e)
+        {
+            SetCollapsed(!uiCollapsed);
         }
 
         private void OnAutoClick(object sender, RoutedEventArgs e)
@@ -2518,6 +2557,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [Display(Name = "Show dashboard", Order = 4, GroupName = "6. Display")]
         public bool ShowDashboard { get; set; }
+
+        [Display(Name = "Start dashboard collapsed", Description = "Start with only the title, position and the AUTO / direction / FLAT buttons. The arrow button toggles it on the chart.", Order = 5, GroupName = "6. Display")]
+        public bool DashboardCollapsed { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Pause entries in chop", Description = "Chop = in the lookback, closes crossed the Globex VWAP at least 'Min crosses' times (EMA crosses don't count: they are the setup) and efficiency (net move / distance travelled) is at or below 'Chop max efficiency'. No new limits, waiting limit cancelled.", Order = 1, GroupName = "7. Chop / trend")]
