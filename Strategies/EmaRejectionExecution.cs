@@ -215,6 +215,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Border uiBorder;
         private StackPanel uiRow2;
         private bool uiCollapsed;   // UI thread only
+        private string uiPosText = "FLAT";   // UI thread only
 
         protected override void OnStateChange()
         {
@@ -2092,6 +2093,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (infoText == null)
                     return;
+                uiPosText = posText;
                 titleText.Text = uiCollapsed ? "EMAR  " + posText : "EMA REJECTION EXEC";
                 infoText.Text = text;
                 statusText.Text       = status;
@@ -2228,7 +2230,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             uiRow2.Visibility     = v;
             uiBorder.MinWidth     = collapsed ? 0 : 270;
             collapseButton.Content = collapsed ? "\u25B8" : "\u25BE";
-            titleText.Text        = collapsed ? "EMAR" : "EMA REJECTION EXEC";   // the position follows on the next refresh
+            titleText.Text        = collapsed ? "EMAR  " + uiPosText : "EMA REJECTION EXEC";
         }
 
         private void OnCollapseClick(object sender, RoutedEventArgs e)
