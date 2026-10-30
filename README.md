@@ -91,7 +91,7 @@ Cumulative delta (volume traded at the ask minus volume at the bid), drawn as ca
 - **EMAs** 21 / 55 on the delta close.
 - **Delta swings:** confirmed after a reversal of *N* x the average delta bar range. Green dot = delta higher low, red = lower high.
 - **Divergence:** price makes an equal or lower swing low (swing size = a share of the session VWAP SD) while delta's low there is higher. Cyan triangle; magenta for the bearish mirror.
-- **Flags for strategies** (set on bar close, +1 / -1 / 0): `EmaState`, `HlState`, `Divergence`.
+- **Flags for strategies** (set on bar close, +1 / -1 / 0): `EmaState`, `HlState`, `Divergence`, `PriceHlState` (price higher low / lower high, same swing method) and `DeltaVsEma` (delta above / below its fast EMA).
 - **Logger** (off by default): one CSV per day in `Documents\NinjaTrader 8\analysis\bars\` with OHLCV, session VWAP and SD, EMA, delta OHLC, the delta EMAs and the flags. Only sessions that start while loaded are written; reloading the chart rewrites a day instead of duplicating it.
 
 The flags are logged first and are not filters: they become one only if the data shows they help.

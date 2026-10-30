@@ -1,4 +1,4 @@
-#region Using declarations
+﻿#region Using declarations
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -95,11 +95,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private bool sawTick;
 
 		private Series<double> vwapSeries, sdSeries, priceEma;
-		private Series<int> emaState, hlState, divergence;
+		private Series<int> emaState, hlState, divergence, priceHlState, deltaVsEma;
 		private SwingTracker priceZz, deltaZz;
 		private double prevDivPriceLow = double.NaN, prevDivDeltaLow = double.NaN, prevDivPriceHigh = double.NaN, prevDivDeltaHigh = double.NaN;
 		private int lastDivergenceBar = -1;
-		private int lastEmaState, lastHlState, lastDivergence;   // flags of the last closed bar
+		private int lastEmaState, lastHlState, lastDivergence, lastPriceHlState, lastDeltaVsEma;   // flags of the last closed bar
 		private SessionIterator sessionIterator;
 		private string logDay;     // trading day of the session being logged
 		private double pendHiRel = double.MinValue, pendLoRel = double.MaxValue;   // extremes of pendingDelta since the last apply
@@ -111,7 +111,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private HashSet<string> logStarted = new HashSet<string>();   // files (re)created in this run; under writeLock
 		private Timer logTimer;
 		private bool logSession;   // log only sessions that started while loaded (no partial first day)
-		private const string LogHeader = "date,time,open,high,low,close,volume,vwap,sd,ema,d_open,d_high,d_low,d_close,d_ema_fast,d_ema_slow,ema_state,hl_state,divergence";
+		private const string LogHeader = "date,time,open,high,low,close,volume,vwap,sd,ema,d_open,d_high,d_low,d_close,d_ema_fast,d_ema_slow,ema_state,hl_state,divergence,price_hl_state,delta_vs_ema";
 
 		private SharpDX.Direct2D1.Brush dxUp, dxDown, dxWick;
 
@@ -165,6 +165,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				emaState = new Series<int>(this);
 				hlState = new Series<int>(this);
 				divergence = new Series<int>(this);
+				priceHlState = new Series<int>(this);
+				deltaVsEma = new Series<int>(this);
 				priceZz = new SwingTracker();
 				deltaZz = new SwingTracker();
 				sessionIterator = new SessionIterator(Bars);
@@ -315,6 +317,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			int bar = CurrentBar - 1;
 			emaState[1] = DeltaEmaFast[1] > DeltaEmaSlow[1] ? 1 : DeltaEmaFast[1] < DeltaEmaSlow[1] ? -1 : 0;
+			deltaVsEma[1] = DeltaClose[1] > DeltaEmaFast[1] ? 1 : DeltaClose[1] < DeltaEmaFast[1] ? -1 : 0;
 
 			// Price swings: a share of the session SD, never under MinSwingPts
 			double pThr = Math.Max(MinSwingPts, PriceSwingSd * sdSeries[1]);
@@ -331,6 +334,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			bool hl = !double.IsNaN(deltaZz.PrevLow) && deltaZz.LastLow > deltaZz.PrevLow;
 			bool lh = !double.IsNaN(deltaZz.PrevHigh) && deltaZz.LastHigh < deltaZz.PrevHigh;
 			hlState[1] = hl && !lh ? 1 : lh && !hl ? -1 : 0;
+
+			// Price structure with the same swing method: +1 higher low (not a lower high), -1 lower high, 0 mixed / none
+			bool phl = !double.IsNaN(priceZz.PrevLow) && priceZz.LastLow > priceZz.PrevLow;
+			bool plh = !double.IsNaN(priceZz.PrevHigh) && priceZz.LastHigh < priceZz.PrevHigh;
+			priceHlState[1] = phl && !plh ? 1 : plh && !phl ? -1 : 0;
 
 			if (ShowMarkers && dSwing != 0)
 			{
@@ -363,6 +371,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			lastEmaState = emaState[1];
 			lastHlState = hlState[1];
 			lastDivergence = div;
+			lastPriceHlState = priceHlState[1];
+			lastDeltaVsEma = deltaVsEma[1];
 			if (div != 0)
 			{
 				lastDivergenceBar = bar;
@@ -410,7 +420,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				.Append(Math.Round(vwapSeries[1], 2).ToString(ci)).Append(',').Append(Math.Round(sdSeries[1], 2).ToString(ci)).Append(',').Append(Math.Round(priceEma[1], 2).ToString(ci)).Append(',')
 				.Append(DeltaOpen[1].ToString(ci)).Append(',').Append(DeltaHigh[1].ToString(ci)).Append(',').Append(DeltaLow[1].ToString(ci)).Append(',').Append(DeltaClose[1].ToString(ci)).Append(',')
 				.Append(Math.Round(DeltaEmaFast[1], 1).ToString(ci)).Append(',').Append(Math.Round(DeltaEmaSlow[1], 1).ToString(ci)).Append(',')
-				.Append(emaState[1].ToString(ci)).Append(',').Append(hlState[1].ToString(ci)).Append(',').Append(divergence[1].ToString(ci));
+				.Append(emaState[1].ToString(ci)).Append(',').Append(hlState[1].ToString(ci)).Append(',').Append(divergence[1].ToString(ci)).Append(',')
+				.Append(priceHlState[1].ToString(ci)).Append(',').Append(deltaVsEma[1].ToString(ci));
 			lock (logLock)
 				logQueue.Add(new KeyValuePair<string, string>(Path.Combine(LogFolder, name), sb.ToString()));
 		}
@@ -517,6 +528,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Browsable(false)] [XmlIgnore] public int LastEmaState { get { return lastEmaState; } }
 		[Browsable(false)] [XmlIgnore] public int LastHlState { get { return lastHlState; } }
 		[Browsable(false)] [XmlIgnore] public int LastDivergence { get { return lastDivergence; } }
+		[Browsable(false)] [XmlIgnore] public int LastPriceHlState { get { return lastPriceHlState; } }
+		[Browsable(false)] [XmlIgnore] public int LastDeltaVsEma { get { return lastDeltaVsEma; } }
+		[Browsable(false)] [XmlIgnore] public Series<int> PriceHlState { get { return priceHlState; } }
+		[Browsable(false)] [XmlIgnore] public Series<int> DeltaVsEma { get { return deltaVsEma; } }
 		[Browsable(false)] [XmlIgnore] public bool HasTicks { get { return sawTick; } }
 
 		[NinjaScriptProperty]
