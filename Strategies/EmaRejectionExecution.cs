@@ -215,7 +215,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Border uiBorder;
         private StackPanel uiRow2;
         private bool uiCollapsed;   // UI thread only
-        private string uiPosText = "FLAT";   // UI thread only
+        private string uiPosText = "Flat";   // UI thread only
 
         protected override void OnStateChange()
         {
@@ -2087,14 +2087,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool isArmed  = armed;
             string dir    = Direction == EmaRejDirection.Both ? "BOTH" : Direction == EmaRejDirection.LongOnly ? "LONG" : "SHORT";
             Position pos  = Positions[execIdx];
-            string posText = pos.MarketPosition == MarketPosition.Flat ? "FLAT"
-                : (pos.MarketPosition == MarketPosition.Long ? "LONG " : "SHORT ") + pos.Quantity;
+            string posText = pos.MarketPosition == MarketPosition.Flat ? "Flat"
+                : (pos.MarketPosition == MarketPosition.Long ? "Long " : "Short ") + pos.Quantity;
             chartControlRef.Dispatcher.InvokeAsync(new Action(() =>
             {
                 if (infoText == null)
                     return;
                 uiPosText = posText;
-                titleText.Text = uiCollapsed ? "EMAR  " + posText : "EMA REJECTION EXEC";
+                titleText.Text = uiCollapsed ? "EMA REJ \u00B7 " + posText : "EMA REJECTION EXEC";
                 infoText.Text = text;
                 statusText.Text       = status;
                 statusText.Foreground = statusBrush;
@@ -2149,7 +2149,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             StackPanel inner = new StackPanel();
             StackPanel header = new StackPanel { Orientation = Orientation.Horizontal };
             collapseButton = MakeButton("\u25BE", 22, Brushes.Gainsboro);
-            collapseButton.Height = 20;
+            collapseButton.Height   = 22;
+            collapseButton.MinWidth = 0;   // NinjaTrader's button style has a wide minimum
+            collapseButton.Padding  = new Thickness(0);
+            collapseButton.FontSize = 14;
             collapseButton.Margin = new Thickness(0, 0, 6, 0);
             collapseButton.ToolTip = "Hide / show the dashboard details";
             titleText = new TextBlock { Text = "EMA REJECTION EXEC", FontWeight = FontWeights.Bold, Foreground = Brushes.Gold, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
@@ -2230,7 +2233,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             uiRow2.Visibility     = v;
             uiBorder.MinWidth     = collapsed ? 0 : 270;
             collapseButton.Content = collapsed ? "\u25B8" : "\u25BE";
-            titleText.Text        = collapsed ? "EMAR  " + uiPosText : "EMA REJECTION EXEC";
+            titleText.Text        = collapsed ? "EMA REJ \u00B7 " + uiPosText : "EMA REJECTION EXEC";
         }
 
         private void OnCollapseClick(object sender, RoutedEventArgs e)
