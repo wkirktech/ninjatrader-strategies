@@ -18,3 +18,4 @@
 !/Indicators/
 /Indicators/*
 !/Indicators/TpoMarketProfile.cs
+!/Indicators/DeltaConfluence.cs
