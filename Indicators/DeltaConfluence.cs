@@ -194,17 +194,21 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (DeltaSource != DeltaSourceMode.TickReplay || e.MarketDataType != MarketDataType.Last || e.Volume <= 0)
 				return;
-			int side = e.Ask > 0 && e.Price >= e.Ask ? 1 : e.Bid > 0 && e.Price <= e.Bid ? -1 : 0;
-			AddTrade(e.Price, e.Volume, side);
+			AddTrade(e.Price, e.Volume, e.Ask, e.Bid);
 		}
 
-		// side 0 = unknown: the tick rule (up from the last trade = buy, down = sell, same = as before)
-		private void AddTrade(double price, double volume, int side)
+		// At or above the ask = buy, at or below the bid = sell, inside the spread = not counted (as Gill's CumDelta).
+		// Without quotes: the tick rule (up from the last trade = buy, down = sell, same = as before).
+		private void AddTrade(double price, double volume, double ask, double bid)
 		{
-			if (side == 0)
+			int side;
+			if (ask > 0 && bid > 0)
+				side = price >= ask ? 1 : price <= bid ? -1 : 0;
+			else
 				side = price > lastPrice ? 1 : price < lastPrice ? -1 : lastSide;
 			lastPrice = price;
-			lastSide = side;
+			if (side != 0)
+				lastSide = side;
 
 			pendingDelta += side * volume;
 			pendHiRel = Math.Max(pendHiRel, pendingDelta);
@@ -219,17 +223,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (BarsInProgress == 1)
 			{
-				// 1-tick series: bid / ask in realtime; history has no quotes, so the tick rule
-				if (CurrentBars[1] < 0 || Volumes[1][0] <= 0)
+				// 1-tick series: each tick bar carries the bid / ask at that trade, in history and live
+				int b = CurrentBars[1];
+				if (b < 0 || Volumes[1][0] <= 0)
 					return;
-				double price = Closes[1][0];
-				int side = 0;
-				if (State == State.Realtime)
-				{
-					double ask = GetCurrentAsk(1), bid = GetCurrentBid(1);
-					side = ask > 0 && price >= ask ? 1 : bid > 0 && price <= bid ? -1 : 0;
-				}
-				AddTrade(price, Volumes[1][0], side);
+				AddTrade(Closes[1][0], Volumes[1][0], BarsArray[1].GetAsk(b), BarsArray[1].GetBid(b));
 				return;
 			}
 			if (BarsInProgress != 0)
@@ -525,7 +523,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Reset delta", Description = "Session: delta starts at 0 each session. Never: one running total.", Order = 1, GroupName = "1. Delta")]
 		public DeltaResetMode ResetMode { get; set; }
 
-		[Display(Name = "Delta source", Description = "Tick series: loads a 1-tick series, so history works on any chart (tick rule in history, bid/ask live). Tick Replay: bid/ask for every trade, needs Tick Replay on the chart.", Order = 6, GroupName = "1. Delta")]
+		[Display(Name = "Delta source", Description = "Tick series: loads a 1-tick series with the bid / ask of every trade, so history works on any chart (same method as the CumDelta indicator). Tick Replay: bid/ask for every trade, needs Tick Replay on the chart.", Order = 6, GroupName = "1. Delta")]
 		public DeltaSourceMode DeltaSource { get; set; }
 
 		[NinjaScriptProperty]
