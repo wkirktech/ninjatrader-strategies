@@ -5,6 +5,7 @@ Automated trading strategies for [NinjaTrader 8](https://ninjatrader.com/), writ
 | Strategy | What it does |
 |---|---|
 | [EmaRejectionExecution](Strategies/EmaRejectionExecution.cs) | Detects price rejecting (or bouncing off) an EMA with lower-high / higher-low structure, then works a limit order that rides the EMA, with an on-chart dashboard and an AUTO on/off switch. |
+| [DeltaConfluence](Indicators/DeltaConfluence.cs) (indicator) | Cumulative delta candles with EMAs, delta swing structure and price/delta divergence; optional per-bar CSV logger for offline backtests. |
 
 > **Disclaimer:** this is personal project code shared for educational and portfolio purposes. It is not financial advice. Futures trading carries substantial risk of loss. Test in a simulation account first.
 
@@ -82,6 +83,18 @@ Every event (orders, fills, drags, chop, auto on/off) is also written to `Docume
 4. **Live Sim101** before any funded account.
 
 ---
+
+## DeltaConfluence (indicator)
+
+Cumulative delta (volume traded at the ask minus volume at the bid), drawn as candles in a panel under price. History comes from a 1-tick series it loads itself, with the bid/ask stored for every trade (same method as the CumDelta indicator), or from Tick Replay (bid/ask for every trade) via *Delta source*.
+
+- **EMAs** 21 / 55 on the delta close.
+- **Delta swings:** confirmed after a reversal of *N* x the average delta bar range. Green dot = delta higher low, red = lower high.
+- **Divergence:** price makes an equal or lower swing low (swing size = a share of the session VWAP SD) while delta's low there is higher. Cyan triangle; magenta for the bearish mirror.
+- **Flags for strategies** (set on bar close, +1 / -1 / 0): `EmaState`, `HlState`, `Divergence`, `PriceHlState` (price higher low / lower high, same swing method) and `DeltaVsEma` (delta above / below its fast EMA).
+- **Logger** (off by default): one CSV per day in `Documents\NinjaTrader 8\analysis\bars\` with OHLCV, session VWAP and SD, EMA, delta OHLC, the delta EMAs and the flags. Only sessions that start while loaded are written; reloading the chart rewrites a day instead of duplicating it.
+
+The flags are logged first and are not filters: they become one only if the data shows they help.
 
 ## Agents
 
