@@ -20,9 +20,11 @@ using NinjaTrader.NinjaScript.DrawingTools;
 // Cumulative delta (trades at the ask minus trades at the bid) drawn as candles, with two EMAs, delta swing
 // structure and price/delta divergence. Flags are exposed for strategies; an optional logger writes one CSV row
 // per closed bar (price, session VWAP and SD, EMA, delta, flags) for offline backtests.
+public enum DeltaResetMode { Session, Never }
+public enum DeltaSourceMode { TickSeries, TickReplay }
+
 namespace NinjaTrader.NinjaScript.Indicators
 {
-	public enum DeltaResetMode { Session, Never }
 
 	public class DeltaConfluence : Indicator
 	{
@@ -97,11 +99,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SwingTracker priceZz, deltaZz;
 		private double prevDivPriceLow = double.NaN, prevDivDeltaLow = double.NaN, prevDivPriceHigh = double.NaN, prevDivDeltaHigh = double.NaN;
 		private int lastDivergenceBar = -1;
+		private int lastEmaState, lastHlState, lastDivergence;   // flags of the last closed bar
+		private SessionIterator sessionIterator;
+		private string logDay;     // trading day of the session being logged
+		private double pendHiRel = double.MinValue, pendLoRel = double.MaxValue;   // extremes of pendingDelta since the last apply
 
 		// Logger: lines are queued on the indicator thread and written by a timer on a pool thread
 		private readonly object logLock = new object();
+		private readonly object writeLock = new object();   // one flush at a time, so rows stay in order
 		private List<KeyValuePair<string, string>> logQueue = new List<KeyValuePair<string, string>>();
-		private HashSet<string> logStarted = new HashSet<string>();   // files (re)created in this run; pool thread only
+		private HashSet<string> logStarted = new HashSet<string>();   // files (re)created in this run; under writeLock
 		private Timer logTimer;
 		private bool logSession;   // log only sessions that started while loaded (no partial first day)
 		private const string LogHeader = "date,time,open,high,low,close,volume,vwap,sd,ema,d_open,d_high,d_low,d_close,d_ema_fast,d_ema_slow,ema_state,hl_state,divergence";
@@ -112,7 +119,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (State == State.SetDefaults)
 			{
-				Description = "Cumulative delta candles (ask trades minus bid trades) with EMAs, delta swing structure and price/delta divergence. Needs Tick Replay for history.";
+				Description = "Cumulative delta candles (ask trades minus bid trades) with EMAs, delta swing structure and price/delta divergence. History from a 1-tick series (tick rule) or Tick Replay (bid/ask).";
 				Name = "DeltaConfluence";
 				Calculate = Calculate.OnEachTick;
 				IsOverlay = false;
@@ -123,6 +130,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				MaximumBarsLookBack = MaximumBarsLookBack.Infinite;
 
 				ResetMode = DeltaResetMode.Session;
+				DeltaSource = DeltaSourceMode.TickSeries;
 				EmaFast = 21;
 				EmaSlow = 55;
 				PriceEmaPeriod = 55;
@@ -144,6 +152,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 				AddPlot(Brushes.Goldenrod, "DeltaEmaFast");
 				AddPlot(Brushes.DarkGoldenrod, "DeltaEmaSlow");
 			}
+			else if (State == State.Configure)
+			{
+				if (DeltaSource == DeltaSourceMode.TickSeries)
+					AddDataSeries(BarsPeriodType.Tick, 1);
+			}
 			else if (State == State.DataLoaded)
 			{
 				vwapSeries = new Series<double>(this);
@@ -154,6 +167,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				divergence = new Series<int>(this);
 				priceZz = new SwingTracker();
 				deltaZz = new SwingTracker();
+				sessionIterator = new SessionIterator(Bars);
 				if (LogBars)
 					logTimer = new Timer(o => FlushLog(), null, 2000, 2000);
 			}
@@ -162,56 +176,96 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				if (logTimer != null)
 				{
-					logTimer.Dispose();
+					// Wait for a flush already running, then write the rest
+					using (ManualResetEvent done = new ManualResetEvent(false))
+					{
+						logTimer.Dispose(done);
+						done.WaitOne(2000);
+					}
 					logTimer = null;
 					FlushLog();
 				}
+				DisposeBrushes();
 			}
 		}
 
+		// Tick Replay source: every trade with the bid / ask at that moment
 		protected override void OnMarketData(MarketDataEventArgs e)
 		{
-			if (e.MarketDataType != MarketDataType.Last || e.Volume <= 0)
+			if (DeltaSource != DeltaSourceMode.TickReplay || e.MarketDataType != MarketDataType.Last || e.Volume <= 0)
 				return;
-			double price = e.Price;
-			int side;
-			if (e.Ask > 0 && price >= e.Ask)
-				side = 1;
-			else if (e.Bid > 0 && price <= e.Bid)
-				side = -1;
-			else
-				side = price > lastPrice ? 1 : price < lastPrice ? -1 : lastSide;   // inside the spread: tick rule
+			int side = e.Ask > 0 && e.Price >= e.Ask ? 1 : e.Bid > 0 && e.Price <= e.Bid ? -1 : 0;
+			AddTrade(e.Price, e.Volume, side);
+		}
+
+		// side 0 = unknown: the tick rule (up from the last trade = buy, down = sell, same = as before)
+		private void AddTrade(double price, double volume, int side)
+		{
+			if (side == 0)
+				side = price > lastPrice ? 1 : price < lastPrice ? -1 : lastSide;
 			lastPrice = price;
 			lastSide = side;
 
-			double v = e.Volume;
-			pendingDelta += side * v;
-			pendingV += v;
-			pendingPV += price * v;
-			pendingP2V += price * price * v;
+			pendingDelta += side * volume;
+			pendHiRel = Math.Max(pendHiRel, pendingDelta);
+			pendLoRel = Math.Min(pendLoRel, pendingDelta);
+			pendingV += volume;
+			pendingPV += price * volume;
+			pendingP2V += price * price * volume;
 			sawTick = true;
 		}
 
 		protected override void OnBarUpdate()
 		{
-			if (CurrentBar == 0 && State == State.Historical && !Bars.IsTickReplay)
-				Draw.TextFixed(this, "dcWarn", "DeltaConfluence: enable Tick Replay on this chart for historical delta", TextPosition.BottomLeft);
+			if (BarsInProgress == 1)
+			{
+				// 1-tick series: bid / ask in realtime; history has no quotes, so the tick rule
+				if (CurrentBars[1] < 0 || Volumes[1][0] <= 0)
+					return;
+				double price = Closes[1][0];
+				int side = 0;
+				if (State == State.Realtime)
+				{
+					double ask = GetCurrentAsk(1), bid = GetCurrentBid(1);
+					side = ask > 0 && price >= ask ? 1 : bid > 0 && price <= bid ? -1 : 0;
+				}
+				AddTrade(price, Volumes[1][0], side);
+				return;
+			}
+			if (BarsInProgress != 0)
+				return;
+
+			if (CurrentBar == 0 && DeltaSource == DeltaSourceMode.TickReplay && State == State.Historical && !Bars.IsTickReplay)
+				Draw.TextFixed(this, "dcWarn", "DeltaConfluence: enable Tick Replay on this chart, or set Delta source to Tick series", TextPosition.BottomLeft);
 
 			bool first = IsFirstTickOfBar;
 			bool reset = first && Bars.IsFirstBarOfSession && (ResetMode == DeltaResetMode.Session || CurrentBar == 0);
+
+			// A closed bar: structure, flags and the log row for bar 1, still in its own session
+			if (first && CurrentBar > 0)
+				CloseBar();
+
 			if (first && Bars.IsFirstBarOfSession)
 			{
 				// VWAP always resets with the session; the delta only in Session mode
 				sumV = sumPV = sumP2V = 0;
-				logSession = LogBars && CurrentBar > 0;
+				logSession = LogBars && CurrentBar > 0;   // no partial first session
+				if (sessionIterator.GetNextSession(Time[0], true))
+					logDay = sessionIterator.ActualTradingDayExchange.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+				else
+					logDay = Time[0].ToString("yyyyMMdd", CultureInfo.InvariantCulture);
 			}
 			if (reset)
+			{
+				// Delta restarts at 0: yesterday's swings and divergence lows aren't comparable any more
 				cum = 0;
+				deltaZz = new SwingTracker();
+				prevDivPriceLow = prevDivDeltaLow = prevDivPriceHigh = prevDivDeltaHigh = double.NaN;
+			}
 
-			// A closed bar: structure and flags for bar 1 before this bar starts
-			if (first && CurrentBar > 0)
-				CloseBar();
-
+			// Apply the trades since the last call, keeping their intrabar extremes (history runs once per bar)
+			double baseCum = cum;
+			bool hadTrades = pendHiRel != double.MinValue;
 			cum += pendingDelta;
 			sumV += pendingV;
 			sumPV += pendingPV;
@@ -227,13 +281,22 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 			barHigh = Math.Max(barHigh, cum);
 			barLow = Math.Min(barLow, cum);
+			if (hadTrades)
+			{
+				barHigh = Math.Max(barHigh, baseCum + pendHiRel);
+				barLow = Math.Min(barLow, baseCum + pendLoRel);
+			}
+			pendHiRel = double.MinValue;
+			pendLoRel = double.MaxValue;
 			DeltaHigh[0] = barHigh;
 			DeltaLow[0] = barLow;
 			DeltaClose[0] = cum;
 
+			// EMAs restart with the delta in Session mode
 			double aF = 2.0 / (EmaFast + 1), aS = 2.0 / (EmaSlow + 1), aP = 2.0 / (PriceEmaPeriod + 1);
-			DeltaEmaFast[0] = CurrentBar == 0 ? cum : DeltaEmaFast[1] + aF * (cum - DeltaEmaFast[1]);
-			DeltaEmaSlow[0] = CurrentBar == 0 ? cum : DeltaEmaSlow[1] + aS * (cum - DeltaEmaSlow[1]);
+			bool seed = CurrentBar == 0 || (Bars.IsFirstBarOfSession && ResetMode == DeltaResetMode.Session);
+			DeltaEmaFast[0] = seed ? cum : DeltaEmaFast[1] + aF * (cum - DeltaEmaFast[1]);
+			DeltaEmaSlow[0] = seed ? cum : DeltaEmaSlow[1] + aS * (cum - DeltaEmaSlow[1]);
 			priceEma[0] = CurrentBar == 0 ? Close[0] : priceEma[1] + aP * (Close[0] - priceEma[1]);
 
 			if (sumV > 0)
@@ -299,6 +362,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				prevDivDeltaHigh = dAt;
 			}
 			divergence[1] = div;
+			lastEmaState = emaState[1];
+			lastHlState = hlState[1];
+			lastDivergence = div;
 			if (div != 0)
 			{
 				lastDivergenceBar = bar;
@@ -337,7 +403,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			DateTime t = Time[1];
 			string name = Instrument.MasterInstrument.Name + "_" + BarsPeriod.Value.ToString(CultureInfo.InvariantCulture)
-				+ BarsPeriod.BarsPeriodType.ToString() + "_" + t.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + ".csv";
+				+ BarsPeriod.BarsPeriodType.ToString() + "_" + logDay + ".csv";   // by trading day: the 18:00 ET start belongs to the next day
 			CultureInfo ci = CultureInfo.InvariantCulture;
 			StringBuilder sb = new StringBuilder(200);
 			sb.Append(t.ToString("yyyy-MM-dd", ci)).Append(',').Append(t.ToString("HH:mm:ss", ci)).Append(',')
@@ -354,6 +420,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 		// Pool thread (timer) and Terminated. A file is recreated with the header the first time this run writes it,
 		// so reloading the chart replaces a day instead of duplicating it.
 		private void FlushLog()
+		{
+			lock (writeLock)
+				FlushLocked();
+		}
+
+		private void FlushLocked()
 		{
 			List<KeyValuePair<string, string>> batch;
 			lock (logLock)
@@ -374,15 +446,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 						byFile[kv.Key] = sb = new StringBuilder();
 					sb.Append(kv.Value).Append("\r\n");
 				}
-				lock (logStarted)
+				foreach (KeyValuePair<string, StringBuilder> f in byFile)
 				{
-					foreach (KeyValuePair<string, StringBuilder> f in byFile)
-					{
-						if (logStarted.Add(f.Key))
-							File.WriteAllText(f.Key, LogHeader + "\r\n" + f.Value);
-						else
-							File.AppendAllText(f.Key, f.Value.ToString());
-					}
+					if (logStarted.Add(f.Key))
+						File.WriteAllText(f.Key, LogHeader + "\r\n" + f.Value);
+					else
+						File.AppendAllText(f.Key, f.Value.ToString());
 				}
 			}
 			catch (Exception ex)
@@ -441,16 +510,23 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Browsable(false)] [XmlIgnore] public Series<double> DeltaEmaFast { get { return Values[4]; } }
 		[Browsable(false)] [XmlIgnore] public Series<double> DeltaEmaSlow { get { return Values[5]; } }
 
-		// Flags, set when a bar closes: +1 bullish, -1 bearish, 0 none
+		// Flags, set when a bar closes, on that bar (read [1] on the first tick of a bar): +1 bullish, -1 bearish, 0 none.
+		// The Last* properties hold the flags of the most recent closed bar.
 		[Browsable(false)] [XmlIgnore] public Series<int> EmaState { get { return emaState; } }
 		[Browsable(false)] [XmlIgnore] public Series<int> HlState { get { return hlState; } }
 		[Browsable(false)] [XmlIgnore] public Series<int> Divergence { get { return divergence; } }
 		[Browsable(false)] [XmlIgnore] public int LastDivergenceBar { get { return lastDivergenceBar; } }
+		[Browsable(false)] [XmlIgnore] public int LastEmaState { get { return lastEmaState; } }
+		[Browsable(false)] [XmlIgnore] public int LastHlState { get { return lastHlState; } }
+		[Browsable(false)] [XmlIgnore] public int LastDivergence { get { return lastDivergence; } }
 		[Browsable(false)] [XmlIgnore] public bool HasTicks { get { return sawTick; } }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Reset delta", Description = "Session: delta starts at 0 each session. Never: one running total.", Order = 1, GroupName = "1. Delta")]
 		public DeltaResetMode ResetMode { get; set; }
+
+		[Display(Name = "Delta source", Description = "Tick series: loads a 1-tick series, so history works on any chart (tick rule in history, bid/ask live). Tick Replay: bid/ask for every trade, needs Tick Replay on the chart.", Order = 6, GroupName = "1. Delta")]
+		public DeltaSourceMode DeltaSource { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
@@ -525,60 +601,3 @@ namespace NinjaTrader.NinjaScript.Indicators
 		#endregion
 	}
 }
-
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private DeltaConfluence[] cacheDeltaConfluence;
-		public DeltaConfluence DeltaConfluence(DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
-		{
-			return DeltaConfluence(Input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
-		}
-
-		public DeltaConfluence DeltaConfluence(ISeries<double> input, DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
-		{
-			if (cacheDeltaConfluence != null)
-				for (int idx = 0; idx < cacheDeltaConfluence.Length; idx++)
-					if (cacheDeltaConfluence[idx] != null && cacheDeltaConfluence[idx].ResetMode == resetMode && cacheDeltaConfluence[idx].EmaFast == emaFast && cacheDeltaConfluence[idx].EmaSlow == emaSlow && cacheDeltaConfluence[idx].DeltaSwingMult == deltaSwingMult && cacheDeltaConfluence[idx].DeltaSwingBars == deltaSwingBars && cacheDeltaConfluence[idx].PriceEmaPeriod == priceEmaPeriod && cacheDeltaConfluence[idx].PriceSwingSd == priceSwingSd && cacheDeltaConfluence[idx].MinSwingPts == minSwingPts && cacheDeltaConfluence[idx].DivToleranceTicks == divToleranceTicks && cacheDeltaConfluence[idx].EqualsInput(input))
-						return cacheDeltaConfluence[idx];
-			return CacheIndicator<DeltaConfluence>(new DeltaConfluence(){ ResetMode = resetMode, EmaFast = emaFast, EmaSlow = emaSlow, DeltaSwingMult = deltaSwingMult, DeltaSwingBars = deltaSwingBars, PriceEmaPeriod = priceEmaPeriod, PriceSwingSd = priceSwingSd, MinSwingPts = minSwingPts, DivToleranceTicks = divToleranceTicks }, input, ref cacheDeltaConfluence);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.DeltaConfluence DeltaConfluence(DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
-		{
-			return indicator.DeltaConfluence(Input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
-		}
-
-		public Indicators.DeltaConfluence DeltaConfluence(ISeries<double> input , DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
-		{
-			return indicator.DeltaConfluence(input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.DeltaConfluence DeltaConfluence(DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
-		{
-			return indicator.DeltaConfluence(Input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
-		}
-
-		public Indicators.DeltaConfluence DeltaConfluence(ISeries<double> input , DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
-		{
-			return indicator.DeltaConfluence(input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
-		}
-	}
-}
-
-#endregion

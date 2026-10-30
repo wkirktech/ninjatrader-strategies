@@ -86,7 +86,7 @@ Every event (orders, fills, drags, chop, auto on/off) is also written to `Docume
 
 ## DeltaConfluence (indicator)
 
-Cumulative delta (volume traded at the ask minus volume at the bid), drawn as candles in a panel under price. **Needs Tick Replay** on the chart for history.
+Cumulative delta (volume traded at the ask minus volume at the bid), drawn as candles in a panel under price. History comes from a 1-tick series it loads itself (tick rule; bid/ask live), or from Tick Replay (bid/ask for every trade) via *Delta source*.
 
 - **EMAs** 21 / 55 on the delta close.
 - **Delta swings:** confirmed after a reversal of *N* x the average delta bar range. Green dot = delta higher low, red = lower high.
