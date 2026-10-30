@@ -41,7 +41,7 @@ Built for NQ / MNQ index futures on fast execution charts (377-tick, 1-min, 3-mi
 - **Price:** a higher low (the indicator's swing method), and a close over the EMA.
 - **Delta:** a delta higher low, and delta over its fast EMA.
 
-*Log only* records the checks in trades.csv (`delta_agree`, `delta_price_hl`, `delta_hl`, `delta_vs_ema`, `delta_ema_state`, `delta_div_ago`) and on the dashboard (Δ ✓ / ✗). *Required* enters at market on the bar where agreement starts while a setup is ready, within *Reclaim max chase* of the EMA. It loads a 1-tick series.
+*Log only* records the checks in trades.csv (`delta_agree`, `delta_price_hl`, `delta_hl`, `delta_vs_ema`, `delta_ema_state`, `delta_div_ago`) and on the dashboard (Δ ✓ / ✗). *Required*: a ready setup enters at market on a bar close where price and delta agree (once per setup), within *Reclaim max chase* of the EMA; further away it waits for a close nearer the EMA. It loads a 1-tick series.
 
 The chart marks a reclaim with a gold **T** and each higher low with a gold triangle. trades.csv tags every trade `rejection`, `trend` or `forced` (column *setup*), so the modes can be compared.
 

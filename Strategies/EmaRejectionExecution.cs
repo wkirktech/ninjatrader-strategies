@@ -65,8 +65,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             public bool PbActive, PbTriggered;
             public bool PbLeft;                               // price was clear of the EMA zone since the reclaim / last pullback
             public int OnSideCount;                           // closes in a row over the EMA (and VWAP) before a trend starts
-            public bool DeltaAgree, AgreeLast, ReadyLast;      // price and delta agree on this side (this bar / last bar), setup ready last bar
-            public bool DeltaTrigger;                         // Required mode: agreement started on this bar with the setup ready
+            public bool DeltaAgree, ReadyLast;                // price and delta agree on this side; setup ready last bar
+            public int DeltaTriggerBar = -1;                  // Required mode: bar where the setup is ready and delta agrees
+            public bool DeltaUsed, DeltaChaseLogged;          // Required mode: this setup already entered / logged too far from the EMA
             public int DeltaDivAgo = -1;                      // bars since a delta divergence on this side (-1 = none in the lookback)
             public double PbExtreme;
             public int PbBar, TriggerBar = -1;                // TriggerBar: the bar that bounced back over the EMA
@@ -89,6 +90,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ClosesBeyond = 0;
                 Forced = false;
                 LeftZone = leftZone;
+                DeltaUsed = DeltaChaseLogged = false;
             }
         }
 
@@ -163,6 +165,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Indicators.DeltaConfluence delta;   // null when Delta confirmation is Off
         private int deltaIdx = -1;                   // its 1-tick series
         private string entryDeltaCols = ",,,,,", tradeDeltaCols = ",,,,,";
+        private bool deltaWarned;
         private string tradeSetup = "";
         private double planLeg = double.NaN;
         private int planAnchor = -1;
@@ -355,6 +358,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 ema = EMA(Closes[0], EmaPeriod);
                 delta = deltaIdx > 0 ? DeltaConfluence(DeltaResetMode.Session, 21, 55, 3, 20, EmaPeriod, 0.15, 5, 2) : null;
+                if (delta != null)
+                    delta.ShowMarkers = false;   // not on the chart: no draw objects
                 if (ShowEma)
                     AddChartIndicator(ema);
 
@@ -789,7 +794,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     floor = s.Dir > 0 ? Math.Min(floor, Low[i]) : Math.Max(floor, High[i]);
                     bool vwapSide = !TrendNeedsVwap || (Values[0].IsValidDataPoint(i) && s.Dir * (Close[i] - Values[0][i]) > eps);
-                    if (i >= c + TrendHoldBars && s.Dir * (Close[i] - ema[i]) > eps && vwapSide)
+                    if (i >= c + s.OnSideCount && s.Dir * (Close[i] - ema[i]) > eps && vwapSide)
                         break;
                 }
                 s.TrendOn      = true;
@@ -1073,15 +1078,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (delta == null)
                 return;
             delta.Update();
+            if (!deltaWarned && State == State.Realtime && !delta.HasTicks)
+            {
+                deltaWarned = true;
+                Log0("Delta: no tick data yet on the 1-tick series, delta flags are 0 until trades come in");
+            }
+            int cb = CurrentBar - c;
             foreach (SideState s in new[] { longSide, shortSide })
             {
                 bool ready = RejectionReady(s) || TrendReady(s);
                 bool agree = DeltaAgrees(s.Dir, c);
-                s.DeltaTrigger = ready && agree && (!s.AgreeLast || !s.ReadyLast);
+                if (!ready)
+                    s.DeltaUsed = s.DeltaChaseLogged = false;
+                // Level, not edge: entry on any closed bar where the setup is ready and delta agrees, once per setup
+                s.DeltaTriggerBar = ready && agree && !s.DeltaUsed ? cb : -1;
                 if (DeltaMode == EmaRejDeltaMode.Required && ready && !s.ReadyLast && !agree)
                     Log0((s.Dir > 0 ? "Long" : "Short") + " setup ready, waiting for delta: " + DeltaWhy(s.Dir, c));
                 s.DeltaAgree  = agree;
-                s.AgreeLast   = agree;
                 s.ReadyLast   = ready;
                 s.DeltaDivAgo = DeltaDivAgo(s.Dir, c);
             }
@@ -1355,10 +1368,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
                 bool reclaim = planViaTrend && PullbackEntry == EmaRejPullbackEntry.OnReclaim;
-                if (reclaim ? s.TriggerBar != cb : !s.DeltaTrigger)
-                    return;
-                s.TriggerBar   = -1;
-                s.DeltaTrigger = false;
+                if (reclaim ? s.TriggerBar != cb : s.DeltaTriggerBar != cb)
+                    return;   // only on a closed bar, never from a mid-bar button click
+                s.TriggerBar      = -1;
+                s.DeltaTriggerBar = -1;
                 if (DeltaMode == EmaRejDeltaMode.Required && !s.Forced && !s.DeltaAgree)
                 {
                     Log0((s.Dir > 0 ? "BUY" : "SELL") + " skipped: delta not confirming (" + DeltaWhy(s.Dir, c) + ")");
@@ -1367,11 +1380,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double chase = s.Dir * (Close[c] - ema[c]);
                 if (chase > ReclaimMaxChasePts + execTick * 0.01)
                 {
+                    // Delta agreement retries on the next close nearer the EMA; logged once per setup
+                    if (!reclaim)
+                    {
+                        if (!s.DeltaChaseLogged)
+                            Log0((s.Dir > 0 ? "BUY" : "SELL") + " waiting: closed " + chase.ToString("0.##") + " pts from EMA (max "
+                                + ReclaimMaxChasePts.ToString("0.##") + ")");
+                        s.DeltaChaseLogged = true;
+                        return;
+                    }
                     Log0((s.Dir > 0 ? "BUY" : "SELL") + " skipped: closed " + chase.ToString("0.##") + " pts from EMA (max "
                         + ReclaimMaxChasePts.ToString("0.##") + ")");
                     return;
                 }
                 SubmitEntry(s, cb, true);
+                if (!reclaim && entryOrder != null)
+                    s.DeltaUsed = true;
                 return;
             }
 
@@ -1619,7 +1643,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             entryDir       = s.Dir;
             entrySignal    = sig;
             entrySubmitBar = cb;
-            int c = CurrentBar - cb;
+            int c = Math.Max(0, CurrentBar - lastProcessedBar);   // the last closed bar, also for a mid-bar button entry
             entryDeltaCols = DeltaCols(s.Dir, c);
             string deltaNote = delta == null || s.Forced ? "" : DeltaAgrees(s.Dir, c) ? " | delta agrees" : " | delta not confirming";
             Log0((s.Dir > 0 ? "BUY" : "SELL") + (atMarket ? " MKT (" + (planViaTrend ? "trend pullback bounce" : "delta agreement") + ", close " + Fmt(planEntry) + ")" : " LMT " + Fmt(planEntry))
@@ -2720,7 +2744,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double CostPerContractUsd { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Delta confirmation", Description = "Price and delta doing the same thing (long: price higher low + close over the EMA, delta higher low + delta over its fast EMA; short mirrors), from DeltaConfluence. Log only: trades.csv and the dashboard record it, trading unchanged. Required: setups enter at market on the bar where agreement starts (within 'Reclaim max chase' of the EMA). Off: no delta (no 1-tick series loaded).", Order = 1, GroupName = "9. Delta")]
+        [Display(Name = "Delta confirmation", Description = "Price and delta doing the same thing (long: price higher low + close over the EMA, delta higher low + delta over its fast EMA; short mirrors), from DeltaConfluence. Log only: trades.csv and the dashboard record it, trading unchanged. Required: a ready setup enters at market on a bar close where price and delta agree, once per setup, within 'Reclaim max chase' of the EMA (a trend 'On reclaim' bounce needs agreement on the bounce bar). Off: no delta (no 1-tick series loaded).", Order = 1, GroupName = "9. Delta")]
         public EmaRejDeltaMode DeltaMode { get; set; }
 
         [NinjaScriptProperty]
