@@ -99,6 +99,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SwingTracker priceZz, deltaZz;
 		private double prevDivPriceLow = double.NaN, prevDivDeltaLow = double.NaN, prevDivPriceHigh = double.NaN, prevDivDeltaHigh = double.NaN;
 		private int lastDivergenceBar = -1;
+		private int lastClosedBar = -1;
 		private int lastEmaState, lastHlState, lastDivergence, lastPriceHlState, lastDeltaVsEma;   // flags of the last closed bar
 		private SessionIterator sessionIterator;
 		private string logDay;     // trading day of the session being logged
@@ -242,8 +243,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 			bool reset = first && Bars.IsFirstBarOfSession && (ResetMode == DeltaResetMode.Session || CurrentBar == 0);
 
 			// A closed bar: structure, flags and the log row for bar 1, still in its own session
-			if (first && CurrentBar > 0)
-				CloseBar();
+			bool barPerCall = State == State.Historical && !Bars.IsTickReplay;
+			if (first && CurrentBar > 0 && !barPerCall)
+				CloseBar(1);
 
 			if (first && Bars.IsFirstBarOfSession)
 			{
@@ -310,35 +312,42 @@ namespace NinjaTrader.NinjaScript.Indicators
 				vwapSeries[0] = Close[0];
 				sdSeries[0] = 0;
 			}
+
+			if (barPerCall)
+				CloseBar(0);
 		}
 
-		// Runs once per closed bar (index 1), on the first tick of the next bar
-		private void CloseBar()
+		// Runs once per closed bar, a bars ago: live, bar 1 on the first tick of the next bar; history without
+		// Tick Replay (one call per finished bar), bar 0 right away, so a strategy reading the bar at its close sees it.
+		private void CloseBar(int a)
 		{
-			int bar = CurrentBar - 1;
-			emaState[1] = DeltaEmaFast[1] > DeltaEmaSlow[1] ? 1 : DeltaEmaFast[1] < DeltaEmaSlow[1] ? -1 : 0;
-			deltaVsEma[1] = DeltaClose[1] > DeltaEmaFast[1] ? 1 : DeltaClose[1] < DeltaEmaFast[1] ? -1 : 0;
+			int bar = CurrentBar - a;
+			if (bar <= lastClosedBar)
+				return;
+			lastClosedBar = bar;
+			emaState[a] = DeltaEmaFast[a] > DeltaEmaSlow[a] ? 1 : DeltaEmaFast[a] < DeltaEmaSlow[a] ? -1 : 0;
+			deltaVsEma[a] = DeltaClose[a] > DeltaEmaFast[a] ? 1 : DeltaClose[a] < DeltaEmaFast[a] ? -1 : 0;
 
 			// Price swings: a share of the session SD, never under MinSwingPts
-			double pThr = Math.Max(MinSwingPts, PriceSwingSd * sdSeries[1]);
-			int pSwing = priceZz.Update(bar, High[1], Low[1], pThr);
+			double pThr = Math.Max(MinSwingPts, PriceSwingSd * sdSeries[a]);
+			int pSwing = priceZz.Update(bar, High[a], Low[a], pThr);
 
 			// Delta swings: DeltaSwingMult x the average delta bar range
 			double avgRange = 0;
-			int n = Math.Min(DeltaSwingBars, CurrentBar);
-			for (int i = 1; i <= n; i++)
+			int n = Math.Min(DeltaSwingBars, CurrentBar - a + 1);
+			for (int i = a; i < a + n; i++)
 				avgRange += DeltaHigh[i] - DeltaLow[i];
 			avgRange = n > 0 ? avgRange / n : 0;
-			int dSwing = deltaZz.Update(bar, DeltaHigh[1], DeltaLow[1], Math.Max(1, DeltaSwingMult * avgRange));
+			int dSwing = deltaZz.Update(bar, DeltaHigh[a], DeltaLow[a], Math.Max(1, DeltaSwingMult * avgRange));
 
 			bool hl = !double.IsNaN(deltaZz.PrevLow) && deltaZz.LastLow > deltaZz.PrevLow;
 			bool lh = !double.IsNaN(deltaZz.PrevHigh) && deltaZz.LastHigh < deltaZz.PrevHigh;
-			hlState[1] = hl && !lh ? 1 : lh && !hl ? -1 : 0;
+			hlState[a] = hl && !lh ? 1 : lh && !hl ? -1 : 0;
 
 			// Price structure with the same swing method: +1 higher low (not a lower high), -1 lower high, 0 mixed / none
 			bool phl = !double.IsNaN(priceZz.PrevLow) && priceZz.LastLow > priceZz.PrevLow;
 			bool plh = !double.IsNaN(priceZz.PrevHigh) && priceZz.LastHigh < priceZz.PrevHigh;
-			priceHlState[1] = phl && !plh ? 1 : plh && !phl ? -1 : 0;
+			priceHlState[a] = phl && !plh ? 1 : plh && !phl ? -1 : 0;
 
 			if (ShowMarkers && dSwing != 0)
 			{
@@ -367,33 +376,33 @@ namespace NinjaTrader.NinjaScript.Indicators
 				prevDivPriceHigh = priceZz.LastHigh;
 				prevDivDeltaHigh = dAt;
 			}
-			divergence[1] = div;
-			lastEmaState = emaState[1];
-			lastHlState = hlState[1];
+			divergence[a] = div;
+			lastEmaState = emaState[a];
+			lastHlState = hlState[a];
 			lastDivergence = div;
-			lastPriceHlState = priceHlState[1];
-			lastDeltaVsEma = deltaVsEma[1];
+			lastPriceHlState = priceHlState[a];
+			lastDeltaVsEma = deltaVsEma[a];
 			if (div != 0)
 			{
 				lastDivergenceBar = bar;
 				if (ShowMarkers)
 				{
 					if (div > 0)
-						Draw.TriangleUp(this, "dcDiv" + bar, false, 1, DeltaLow[1], Brushes.Cyan);
+						Draw.TriangleUp(this, "dcDiv" + bar, false, a, DeltaLow[a], Brushes.Cyan);
 					else
-						Draw.TriangleDown(this, "dcDiv" + bar, false, 1, DeltaHigh[1], Brushes.Magenta);
+						Draw.TriangleDown(this, "dcDiv" + bar, false, a, DeltaHigh[a], Brushes.Magenta);
 				}
 			}
 
 			if (logSession)
-				QueueLogLine();
+				QueueLogLine(a);
 		}
 
 		// Delta low (high) within a bar of the price swing bar: the delta extreme rarely lands on the exact same bar
 		private double DeltaLowAround(int swingBar)
 		{
 			double v = double.MaxValue;
-			for (int b = Math.Max(0, swingBar - 1); b <= Math.Min(CurrentBar - 1, swingBar + 1); b++)
+			for (int b = Math.Max(0, swingBar - 1); b <= Math.Min(lastClosedBar, swingBar + 1); b++)
 				v = Math.Min(v, DeltaLow.GetValueAt(b));
 			return v;
 		}
@@ -401,27 +410,27 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private double DeltaHighAround(int swingBar)
 		{
 			double v = double.MinValue;
-			for (int b = Math.Max(0, swingBar - 1); b <= Math.Min(CurrentBar - 1, swingBar + 1); b++)
+			for (int b = Math.Max(0, swingBar - 1); b <= Math.Min(lastClosedBar, swingBar + 1); b++)
 				v = Math.Max(v, DeltaHigh.GetValueAt(b));
 			return v;
 		}
 
 		#region Logger
-		private void QueueLogLine()
+		private void QueueLogLine(int a)
 		{
-			DateTime t = Time[1];
+			DateTime t = Time[a];
 			string name = Instrument.MasterInstrument.Name + "_" + BarsPeriod.Value.ToString(CultureInfo.InvariantCulture)
 				+ BarsPeriod.BarsPeriodType.ToString() + "_" + logDay + ".csv";   // by trading day: the 18:00 ET start belongs to the next day
 			CultureInfo ci = CultureInfo.InvariantCulture;
 			StringBuilder sb = new StringBuilder(200);
 			sb.Append(t.ToString("yyyy-MM-dd", ci)).Append(',').Append(t.ToString("HH:mm:ss", ci)).Append(',')
-				.Append(Open[1].ToString(ci)).Append(',').Append(High[1].ToString(ci)).Append(',').Append(Low[1].ToString(ci)).Append(',').Append(Close[1].ToString(ci)).Append(',')
-				.Append(Volume[1].ToString(ci)).Append(',')
-				.Append(Math.Round(vwapSeries[1], 2).ToString(ci)).Append(',').Append(Math.Round(sdSeries[1], 2).ToString(ci)).Append(',').Append(Math.Round(priceEma[1], 2).ToString(ci)).Append(',')
-				.Append(DeltaOpen[1].ToString(ci)).Append(',').Append(DeltaHigh[1].ToString(ci)).Append(',').Append(DeltaLow[1].ToString(ci)).Append(',').Append(DeltaClose[1].ToString(ci)).Append(',')
-				.Append(Math.Round(DeltaEmaFast[1], 1).ToString(ci)).Append(',').Append(Math.Round(DeltaEmaSlow[1], 1).ToString(ci)).Append(',')
-				.Append(emaState[1].ToString(ci)).Append(',').Append(hlState[1].ToString(ci)).Append(',').Append(divergence[1].ToString(ci)).Append(',')
-				.Append(priceHlState[1].ToString(ci)).Append(',').Append(deltaVsEma[1].ToString(ci));
+				.Append(Open[a].ToString(ci)).Append(',').Append(High[a].ToString(ci)).Append(',').Append(Low[a].ToString(ci)).Append(',').Append(Close[a].ToString(ci)).Append(',')
+				.Append(Volume[a].ToString(ci)).Append(',')
+				.Append(Math.Round(vwapSeries[a], 2).ToString(ci)).Append(',').Append(Math.Round(sdSeries[a], 2).ToString(ci)).Append(',').Append(Math.Round(priceEma[a], 2).ToString(ci)).Append(',')
+				.Append(DeltaOpen[a].ToString(ci)).Append(',').Append(DeltaHigh[a].ToString(ci)).Append(',').Append(DeltaLow[a].ToString(ci)).Append(',').Append(DeltaClose[a].ToString(ci)).Append(',')
+				.Append(Math.Round(DeltaEmaFast[a], 1).ToString(ci)).Append(',').Append(Math.Round(DeltaEmaSlow[a], 1).ToString(ci)).Append(',')
+				.Append(emaState[a].ToString(ci)).Append(',').Append(hlState[a].ToString(ci)).Append(',').Append(divergence[a].ToString(ci)).Append(',')
+				.Append(priceHlState[a].ToString(ci)).Append(',').Append(deltaVsEma[a].ToString(ci));
 			lock (logLock)
 				logQueue.Add(new KeyValuePair<string, string>(Path.Combine(LogFolder, name), sb.ToString()));
 		}
