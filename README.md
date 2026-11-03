@@ -6,6 +6,7 @@ Automated trading strategies for [NinjaTrader 8](https://ninjatrader.com/), writ
 |---|---|
 | [EmaRejectionExecution](Strategies/EmaRejectionExecution.cs) | Detects price rejecting (or bouncing off) an EMA with lower-high / higher-low structure, then works a limit order that rides the EMA, with an on-chart dashboard and an AUTO on/off switch. |
 | [DeltaConfluence](Indicators/DeltaConfluence.cs) (indicator) | Cumulative delta candles with EMAs, delta swing structure and price/delta divergence; optional per-bar CSV logger for offline backtests. |
+| [BarLogger](Indicators/BarLogger.cs) (indicator) | Writes every closed bar of a chart (OHLCV, US Eastern time) to one CSV, for long-history research such as daily-bias tests. |
 
 > **Disclaimer:** this is personal project code shared for educational and portfolio purposes. It is not financial advice. Futures trading carries substantial risk of loss. Test in a simulation account first.
 
@@ -95,6 +96,13 @@ Cumulative delta (volume traded at the ask minus volume at the bid), drawn as ca
 - **Logger** (off by default): one CSV per day in `Documents\NinjaTrader 8\analysis\bars\` with OHLCV, session VWAP and SD, EMA, delta OHLC, the delta EMAs and the flags. Only sessions that start while loaded are written; reloading the chart rewrites a day instead of duplicating it.
 
 The flags are logged first and are not filters: they become one only if the data shows they help.
+
+## BarLogger (indicator)
+
+Writes every closed bar of the chart's series to `Documents\NinjaTrader 8\analysis\history\<instrument>_<bar type>.csv` (e.g. `NQ_1Minute.csv`, `NQ_1Day.csv`) with columns `date_et,time_et,open,high,low,close,volume`. Intraday times are bar close times in US Eastern (DST handled); daily bars keep their session date and leave the time blank. Each load replaces the file.
+
+- Use the continuous contract `NQ ##-##` with *Merge policy: Merge back adjusted* (Tools > Options > Market data), or every roll shows up as a fake gap.
+- Set *Days to load* on the data series to the history wanted (e.g. 10 years daily, 3 years 1-minute). The output window prints the bar count and date range once loading finishes.
 
 ## Agents
 
