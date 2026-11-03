@@ -22,14 +22,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 	public class BarLogger : Indicator
 	{
 		private const string LogHeader = "date_et,time_et,open,high,low,close,volume";
+		private static readonly HashSet<string> pathsInUse = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // one writer per file across charts
 
 		// Lines are queued on the indicator thread and written by a timer on a pool thread
 		private readonly object logLock = new object();
 		private readonly object writeLock = new object();   // one flush at a time, so rows stay in order
 		private List<string> logQueue = new List<string>();
 		private bool fileStarted;   // file recreated with the header in this run; under writeLock
+		private bool writeFailed;   // a write threw at least once; its rows were kept and retried
 		private Timer logTimer;
 		private string logPath;
+		private bool ownsPath;
 		private bool isDaily;
 		private TimeZoneInfo eastern;
 		private int rows;
@@ -54,34 +57,49 @@ namespace NinjaTrader.NinjaScript.Indicators
 				eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");   // handles DST
 				logPath = Path.Combine(LogFolder, Instrument.MasterInstrument.Name + "_"
 					+ BarsPeriod.Value.ToString(CultureInfo.InvariantCulture) + BarsPeriod.BarsPeriodType.ToString() + ".csv");
-				logTimer = new Timer(o => FlushLog(), null, 2000, 2000);
+				lock (pathsInUse)
+					ownsPath = pathsInUse.Add(logPath);
+				if (ownsPath)
+					logTimer = new Timer(o => FlushLog(), null, 2000, 2000);
+				else
+					Print("BarLogger: " + logPath + " is already being written by another chart; this copy does not log.");
 			}
 			else if (State == State.Realtime)
 			{
-				if (rows > 0)
+				if (ownsPath && rows > 0)
 					Print("BarLogger " + Instrument.FullName + " " + BarsPeriod + ": " + rows + " bars, "
-						+ firstTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " to " + lastTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " -> " + logPath);
+						+ firstTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " to " + lastTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " -> " + logPath
+						+ (writeFailed ? " (some writes failed and were retried; check the file)" : ""));
 			}
 			else if (State == State.Terminated)
 			{
 				if (logTimer != null)
 				{
-					// Wait for a flush already running, then write the rest
-					using (ManualResetEvent done = new ManualResetEvent(false))
-					{
-						logTimer.Dispose(done);
-						done.WaitOne(2000);
-					}
+					// Wait for a flush already running, then write the rest. The event is left to the GC, not disposed:
+					// a flush longer than the wait would otherwise signal a closed handle on a pool thread.
+					ManualResetEvent done = new ManualResetEvent(false);
+					logTimer.Dispose(done);
+					done.WaitOne(10000);
 					logTimer = null;
 					FlushLog();
+				}
+				if (ownsPath)
+				{
+					lock (pathsInUse)
+						pathsInUse.Remove(logPath);
+					ownsPath = false;
 				}
 			}
 		}
 
 		protected override void OnBarUpdate()
 		{
+			if (!ownsPath)
+				return;
+
 			// Bar times are bar close times in NinjaTrader's time zone
-			DateTime t = isDaily ? Time[0].Date : TimeZoneInfo.ConvertTime(Time[0], NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo, eastern);
+			DateTime t = isDaily ? Time[0].Date
+				: TimeZoneInfo.ConvertTime(DateTime.SpecifyKind(Time[0], DateTimeKind.Unspecified), NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo, eastern);
 			if (rows == 0)
 				firstTime = t;
 			lastTime = t;
@@ -113,20 +131,28 @@ namespace NinjaTrader.NinjaScript.Indicators
 				try
 				{
 					Directory.CreateDirectory(LogFolder);
-					StringBuilder sb = new StringBuilder(batch.Count * 60);
-					foreach (string line in batch)
-						sb.Append(line).Append("\r\n");
-					if (!fileStarted)
+					// Line by line: a 1-minute history can be ~1M rows, too big to build as one string
+					using (StreamWriter w = new StreamWriter(logPath, fileStarted))
 					{
-						File.WriteAllText(logPath, LogHeader + "\r\n" + sb);
-						fileStarted = true;
+						if (!fileStarted)
+							w.Write(LogHeader + "\r\n");
+						foreach (string line in batch)
+							w.Write(line + "\r\n");
 					}
-					else
-						File.AppendAllText(logPath, sb.ToString());
+					fileStarted = true;
 				}
 				catch (Exception ex)
 				{
-					Print("BarLogger: " + ex.Message);
+					// File locked (OneDrive, Excel): put the rows back in front, in order, and retry on the next tick.
+					// A failed first write leaves fileStarted false, so the retry recreates the file with the header.
+					lock (logLock)
+					{
+						batch.AddRange(logQueue);
+						logQueue = batch;
+					}
+					if (!writeFailed)
+						Print("BarLogger: " + ex.Message + " (will retry)");
+					writeFailed = true;
 				}
 			}
 		}
