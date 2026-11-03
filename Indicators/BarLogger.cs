@@ -32,7 +32,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private bool writeFailed;   // a write threw at least once; its rows were kept and retried
 		private Timer logTimer;
 		private string logPath;
-		private bool ownsPath;
+		private bool ownsPath;      // claimed on the first flush, after an old copy on a reloaded chart has released it
+		private volatile bool skipLog;   // another chart owns the file
 		private bool isDaily;
 		private TimeZoneInfo eastern;
 		private int rows;
@@ -57,16 +58,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 				eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");   // handles DST
 				logPath = Path.Combine(LogFolder, Instrument.MasterInstrument.Name + "_"
 					+ BarsPeriod.Value.ToString(CultureInfo.InvariantCulture) + BarsPeriod.BarsPeriodType.ToString() + ".csv");
-				lock (pathsInUse)
-					ownsPath = pathsInUse.Add(logPath);
-				if (ownsPath)
-					logTimer = new Timer(o => FlushLog(), null, 2000, 2000);
-				else
-					Print("BarLogger: " + logPath + " is already being written by another chart; this copy does not log.");
+				logTimer = new Timer(o => FlushLog(), null, 2000, 2000);
 			}
 			else if (State == State.Realtime)
 			{
-				if (ownsPath && rows > 0)
+				if (!skipLog && rows > 0)
 					Print("BarLogger " + Instrument.FullName + " " + BarsPeriod + ": " + rows + " bars, "
 						+ firstTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " to " + lastTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + " -> " + logPath
 						+ (writeFailed ? " (some writes failed and were retried; check the file)" : ""));
@@ -82,6 +78,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 					done.WaitOne(10000);
 					logTimer = null;
 					FlushLog();
+					lock (logLock)
+						if (logQueue.Count > 0 && !skipLog)
+							Print("BarLogger: " + logQueue.Count + " rows not written to " + logPath + "; the file is incomplete.");
 				}
 				if (ownsPath)
 				{
@@ -94,7 +93,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		protected override void OnBarUpdate()
 		{
-			if (!ownsPath)
+			if (skipLog)
 				return;
 
 			// Bar times are bar close times in NinjaTrader's time zone
@@ -120,6 +119,21 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			lock (writeLock)
 			{
+				if (skipLog)
+					return;
+				if (!ownsPath)
+				{
+					lock (pathsInUse)
+						ownsPath = pathsInUse.Add(logPath);
+					if (!ownsPath)
+					{
+						skipLog = true;
+						lock (logLock)
+							logQueue.Clear();
+						Print("BarLogger: " + logPath + " is already being written by another chart; this copy does not log.");
+						return;
+					}
+				}
 				List<string> batch;
 				lock (logLock)
 				{
