@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 $script = Join-Path $PSScriptRoot 'run-agent.ps1'
 $sheet  = Join-Path $PSScriptRoot 'context_sheet.py'
 $python = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source   # no console window
+if (-not $python -and -not $Remove) { throw 'pythonw.exe not found on PATH' }   # before any job is registered
 $folder = '\EmaRejection\'
 $days   = 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'
 
@@ -31,7 +32,6 @@ foreach ($j in $jobs) {
         continue
     }
     if ($j.Py) {
-        if (-not $python) { throw 'pythonw.exe not found on PATH' }
         $action = New-ScheduledTaskAction -Execute $python -Argument "`"$sheet`""
     } else {
         $action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-NoProfile -WindowStyle Hidden -File `"$script`" -Job $($j.Job)"

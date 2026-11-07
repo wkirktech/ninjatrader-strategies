@@ -11,8 +11,19 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 ANALYSIS = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "analysis"))
-TAIL_BYTES = 4_000_000          # ~5 sessions of 1-min bars, enough for the prior day after a long weekend
+TAIL_BYTES = 4_000_000          # ~50 days of 1-min bars (~57 bytes a row); --at reads the whole file
 STALE_MIN = 15                  # newest bar older than this (during the session) = data not live
+
+# NYSE full holidays: Globex still trades a short session, which must not count as a prior RTH day.
+# Update yearly (early-close days such as Black Friday are real sessions and stay out of this list).
+HOLIDAYS = {
+    "2025-01-01", "2025-01-09", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04",
+    "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06",
+    "2027-11-25", "2027-12-24",
+}
 
 # Hit rates measured on NQ Dec 2021 - Nov 2026 (analysis/research/2026-11-06_mp_stats_report.pdf,
 # 2026-11-06_ib25_step1.md). (all years, 2026 so far)
@@ -24,10 +35,10 @@ STAT_IB_ZONE = (90, 86)         # 10:30 close in the top (bottom) 25% of the IB 
 BASE_IB_HI, BASE_IB_LO = 61, 56 # any day, no condition
 
 
-def read_tail(path):
+def read_tail(path, whole=False):
     size = os.path.getsize(path)
     with open(path, "rb") as f:
-        f.seek(max(0, size - TAIL_BYTES))
+        f.seek(0 if whole else max(0, size - TAIL_BYTES))
         data = f.read().decode("utf-8", "replace")
     lines = data.splitlines()[1:]     # first line is partial (or the header)
     bars = []
@@ -72,7 +83,9 @@ def fmt(x):
 def build(bars, now_et):
     days = sorted({b[0] for b in bars})
     today = now_et.strftime("%Y-%m-%d")
-    prior = [d for d in days if d < today and rth(bars, d)]
+    if today in HOLIDAYS:
+        return None, "Holiday: the cash market is closed today (no RTH session)."
+    prior = [d for d in days if d < today and d not in HOLIDAYS and rth(bars, d)]
     if not prior:
         return None, "No prior session in the export."
     pday = prior[-1]
@@ -89,7 +102,7 @@ def build(bars, now_et):
         warn.append(f"DATA NOT LIVE: newest bar is {last[0]} {last[1]} ET ({age:.0f} min old). Is NinjaTrader open with "
                     "BarLogger on the 1-min NQ chart? Levels below may be incomplete.")
     if not on:
-        return None, "No overnight bars for today in the export yet."
+        return None, " ".join(["No overnight bars for today in the export yet."] + warn)
 
     onh, onl = max(b[3] for b in on), min(b[4] for b in on)
     onm = (onh + onl) / 2
@@ -136,7 +149,9 @@ def build(bars, now_et):
         out.append(f"IB high {fmt(hi)}   IB low {fmt(lo)}   range {rng:.2f} pts   7:30 close {fmt(close)} ({pos:.0%} of the IB)")
         out.append(f"Extensions: high +0.5 IB {fmt(hi + 0.5 * rng)}, +1 IB {fmt(hi + rng)} | low -0.5 IB {fmt(lo - 0.5 * rng)}, -1 IB {fmt(lo - rng)}")
         out.append("")
-        if hi_i > lo_i:
+        if hi_i == lo_i:
+            out.append("- One bar made both the IB high and low: no 'formed last' signal.")
+        elif hi_i > lo_i:
             lean.append(1)
             out.append(f"- IB HIGH formed last -> IB high breaks later on {STAT_IB_HI_LAST[0]}% of days "
                        f"({STAT_IB_HI_LAST[1]}% in 2026; any day {BASE_IB_HI}%).")
@@ -162,7 +177,7 @@ def build(bars, now_et):
     if lean and all(x == lean[0] for x in lean):
         verdict = f"LEAN {'LONG' if lean[0] == 1 else 'SHORT'} ({len(lean)} of {len(lean)} signals agree)"
     elif s:
-        verdict = f"WEAK {'LONG' if s > 0 else 'SHORT'} lean ({len(lean)} signals, mixed)"
+        verdict = f"WEAK {'LONG' if s > 0 else 'SHORT'} lean ({sum(1 for x in lean if x == (1 if s > 0 else -1))} of {len(lean)} signals agree)"
     else:
         verdict = "NO LEAN (signals conflict or none apply)"
     head = [f"# NQ context {today}  (updated {now_et:%H:%M} ET / {(now_et - timedelta(hours=3)):%H:%M} PT)", "",
@@ -174,6 +189,18 @@ def build(bars, now_et):
 
 
 def main():
+    try:
+        run()
+    except Exception as e:      # pythonw has no console: leave the reason in today's file
+        out = os.path.join(ANALYSIS, "briefs")
+        os.makedirs(out, exist_ok=True)
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with open(os.path.join(out, f"{now:%Y-%m-%d}-context.md"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"# NQ context {now:%Y-%m-%d}\n\n> Context sheet failed: {type(e).__name__}: {e}\n")
+        raise
+
+
+def run():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default=os.path.join(ANALYSIS, "history", "NQ_1Minute.csv"))
     ap.add_argument("--out", default=os.path.join(ANALYSIS, "briefs"))
@@ -183,8 +210,8 @@ def main():
     if args.at:
         now_et = datetime.strptime(args.at, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("America/New_York"))
     if not os.path.exists(args.csv):
-        sys.exit(f"Missing {args.csv}: add BarLogger to the 1-min NQ chart.")
-    bars = read_tail(args.csv)
+        raise FileNotFoundError(f"Missing {args.csv}: add BarLogger to the 1-min NQ chart.")
+    bars = read_tail(args.csv, whole=bool(args.at))
     if args.at:
         cut = now_et.strftime("%Y-%m-%d %H:%M:%S")
         bars = [b for b in bars if f"{b[0]} {b[1]}" <= cut]
