@@ -121,6 +121,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			public DateTime Time;
 			public double Low;
 			public double High;
+			public bool NewYork;   // the minute is part of the New York session (09:30-16:00)
 		}
 
 		// One time slice (block) of a session: the price range traded during that slice.
@@ -141,6 +142,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			public TimeSpan End;
 			public int DayOffset;
 			public int Slots = 1;
+			public bool Eth;          // the overnight (ETH) session rather than New York (RTH)
+			public string KeyPrefix;  // start of the keys of its sessions (profile menu, merged and expanded lists)
 		}
 
 		// Raw data of one session (day / week / month / custom session). Never merged; merging happens at profile level.
@@ -169,6 +172,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			public double OpeningClose;
 			public int LastMinuteBar = -1;
 			public int MinuteCount;
+			public bool Eth;
 			public int Version;
 			public int EndPos;
 			public readonly List<TpoBlock> Blocks = new List<TpoBlock>();
@@ -221,6 +225,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			public int CloseRow;
 			public string DayTypeText;
 			public string OpenTypeText;
+			public bool Eth;   // the profile's sessions are ETH sessions
 
 			// Text under the profile, composed on the first redraw that needs it (render thread only).
 			public string Annotation;
@@ -303,6 +308,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 			public TpoBuilt NakedFor;
 			public NakedLevel[] Naked;
 			public long NakedStamp = -1;
+
+			// Single prints traded at again after the profile (render thread, under lock(sync) while updated).
+			public TpoBuilt SinglesFor;
+			public bool[] SinglesDone;
+			public int SinglesLeft;
+			public int SinglesStart;
+			public int SinglesPos;
+			public long SinglesStamp = -1;
 			public int GeoStart;
 			public int GeoEnd;
 			public bool Visible;
@@ -338,7 +351,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private const int LvVolPoc = 5;
 		private const int LvVolVah = 6;
 		private const int LvVolVal = 7;
-		private const int LevelCount = 8;
+		private const int LvHigh = 8;
+		private const int LvLow = 9;
+		private const int LevelCount = 10;
 
 		private readonly object sync = new object();
 		private readonly List<TpoSession> sessions = new List<TpoSession>();
@@ -398,6 +413,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private TimeZoneInfo srcZone;
 		private TimeZoneInfo dstZone;
 		private bool nakedEnabled;
+		private bool keepRanges;
+		private bool bothKinds;   // RTH profiles with the ETH profiles added
 		private bool needVolume;
 
 		// Rendering resources (UI thread only).
@@ -414,11 +431,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private int lastSessionCount = -1;
 		private SharpDX.Direct2D1.SolidColorBrush[] dxPeriod;
 		private SharpDX.Direct2D1.SolidColorBrush[] dxHeat;
+		private SharpDX.Direct2D1.SolidColorBrush[] dxPeriodEth;
+		private SharpDX.Direct2D1.SolidColorBrush[] dxHeatEth;
+		private SharpDX.Direct2D1.SolidColorBrush dxSolidEth;
+		// The block colours of the profile being drawn: the ETH set for ETH profiles when RTH and ETH are shown together.
+		private SharpDX.Direct2D1.SolidColorBrush[] curPeriod;
+		private SharpDX.Direct2D1.SolidColorBrush[] curHeat;
+		private SharpDX.Direct2D1.SolidColorBrush curSolid;
 		private SharpDX.Direct2D1.SolidColorBrush[] dxVolGrade;
 		private SharpDX.Direct2D1.SolidColorBrush[] dxLevel;
 		private bool[] levelIsLight = new bool[LevelCount];
 		private SharpDX.Direct2D1.SolidColorBrush dxSolid;
 		private SharpDX.Direct2D1.SolidColorBrush dxOutside;
+		private SharpDX.Direct2D1.SolidColorBrush dxOutsideEth;
+		private SharpDX.Direct2D1.SolidColorBrush curOutside;
 		private SharpDX.Direct2D1.SolidColorBrush dxPocRow;
 		private SharpDX.Direct2D1.SolidColorBrush dxLetter;
 		private SharpDX.Direct2D1.SolidColorBrush dxOpenBlock;
@@ -436,10 +462,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush dxVolIn;
 		private SharpDX.Direct2D1.SolidColorBrush dxVolOut;
 		private SharpDX.Direct2D1.SolidColorBrush dxText;
-		private SharpDX.Direct2D1.SolidColorBrush dxPriorHigh;
 		private SharpDX.Direct2D1.SolidColorBrush dxGapLine;
 		private SharpDX.Direct2D1.SolidColorBrush dxGapArea;
-		private SharpDX.Direct2D1.SolidColorBrush dxPriorLow;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandVa;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandPoc;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandSingle;
@@ -481,6 +505,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		// Reused from redraw to redraw (render thread only).
 		private GapView[] gapViews = new GapView[0];
 		private TpoProfile[] snapshotBuffer = new TpoProfile[0];
+		private int[] nextSameBuffer = new int[0];
+		private int[] carryBuffer = new int[0];
 		private DateTime[] snapshotEndBuffer = new DateTime[0];
 		private float[] edgeBuffer = new float[256];
 		private float clipLeft;
@@ -510,6 +536,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				// 1. General
 				SessionType = TpoMarketProfileTypes.TpoSessionType.Daily;
 				SessionHours = TpoMarketProfileTypes.TpoSessionHours.RTH;
+				AddEthProfiles = false;
 				BlockSize = TpoMarketProfileTypes.TpoBlockSize.Minutes30;
 				TicksPerRow = 10;
 				ProfileSpacing = 0;
@@ -546,6 +573,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ValLabel = true;
 				ValNaked = false;
 				ValScale = false;
+				HighShow = true;
+				HighLabel = true;
+				HighNaked = false;
+				HighScale = false;
+				LowShow = true;
+				LowLabel = true;
+				LowNaked = false;
+				LowScale = false;
 				LineWidth = 1;
 				FillValueArea = false;
 				ValueAreaFillOpacity = 12;
@@ -566,6 +601,34 @@ namespace NinjaTrader.NinjaScript.Indicators
 				PriorHighlightGlobal = true;
 				PriorHighlightSingles = true;
 				PriorHighlightSingleBrush = Brushes.Magenta;
+
+				// 3b. ETH profile levels (with Add ETH Profiles)
+				EthPocShow = true;
+				EthPocLabel = true;
+				EthPocNaked = false;
+				EthPocScale = false;
+				EthVahShow = true;
+				EthVahLabel = true;
+				EthVahNaked = false;
+				EthVahScale = false;
+				EthValShow = true;
+				EthValLabel = true;
+				EthValNaked = false;
+				EthValScale = false;
+				EthHighShow = true;
+				EthHighLabel = true;
+				EthHighNaked = false;
+				EthHighScale = false;
+				EthLowShow = true;
+				EthLowLabel = true;
+				EthLowNaked = false;
+				EthLowScale = false;
+				EthPriorPocExtend = false;
+				EthPriorVahExtend = false;
+				EthPriorValExtend = false;
+				EthPriorHighExtend = true;
+				EthPriorLowExtend = true;
+				EthNakedPocExtend = true;
 
 				// 4. Profile: structure markers
 				ShowInitialBalance = true;
@@ -633,6 +696,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				HeatHighBrush = Brushes.Crimson;
 				SolidBrush = Brushes.DodgerBlue;
 				OutsideValueAreaBrush = Brushes.Gray;
+				EthOutsideValueAreaBrush = Brushes.DarkSeaGreen;
 				PocRowBrush = Brushes.White;
 				LetterBrush = Brushes.Black;
 				OpenBlockBrush = Brushes.DodgerBlue;
@@ -760,7 +824,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		public override string DisplayName
 		{
-			get { return "TPO Market Profile (" + SessionType + ", " + SessionHours + ", " + BlockLabel() + ")"; }
+			get
+			{
+				string hours = SessionHours.ToString();
+				if (AddEthProfiles && SessionHours == TpoMarketProfileTypes.TpoSessionHours.RTH && SessionType == TpoMarketProfileTypes.TpoSessionType.Daily)
+					hours = "RTH + ETH";
+				return "TPO Market Profile (" + SessionType + ", " + hours + ", " + BlockLabel() + ")";
+			}
 		}
 
 		private string BlockLabel()
@@ -809,8 +879,41 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (srcZone == null || dstZone == null)
 				zoneProblem = "TPO Market Profile: could not work out New York time on this computer, so sessions may be shifted.";
 
+			// The ETH profiles can be added to daily RTH profiles; their sessions get keys of their own ("E...").
+			bothKinds = AddEthProfiles && SessionHours == TpoMarketProfileTypes.TpoSessionHours.RTH
+				&& SessionType == TpoMarketProfileTypes.TpoSessionType.Daily;
+
+			windows = new List<SessionWindow>();
+			windows.Add(MakeWindow(SessionHours == TpoMarketProfileTypes.TpoSessionHours.ETH, keyPrefix));
+			if (bothKinds)
+				windows.Add(MakeWindow(true, "E"));
+
+			needVolume = ShowVolumeProfile || ShowVolumeSummary || StatisticsBox;
+
+			nakedEnabled = false;
+			for (int lv = 0; lv < LevelCount; lv++)
+			{
+				if (NakedTracked(lv, false) || (bothKinds && NakedTracked(lv, true)))
+					nakedEnabled = true;
+			}
+
+			// Minute ranges are kept for naked levels and for single prints that may be traded at again.
+			keepRanges = nakedEnabled || ShowSinglePrints;
+
+			lock (sync)
+			{
+				ParseKeys(MergedSessions, mergedKeys);
+				ParseKeys(ExpandedSessions, expandedKeys);
+				groupingDirty = true;
+			}
+		}
+
+		private SessionWindow MakeWindow(bool eth, string prefix)
+		{
 			SessionWindow window = new SessionWindow();
-			if (SessionHours == TpoMarketProfileTypes.TpoSessionHours.ETH)
+			window.Eth = eth;
+			window.KeyPrefix = prefix;
+			if (eth)
 			{
 				// Overnight: Asia and London, from the evening open to the New York cash open. Belongs to the next day.
 				window.Start = new TimeSpan(18, 0, 0);
@@ -829,25 +932,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (length <= 0)
 				length += 1440.0;
 			window.Slots = Math.Max(1, (int)Math.Ceiling(length / blockMinutes));
-
-			windows = new List<SessionWindow>();
-			windows.Add(window);
-
-			needVolume = ShowVolumeProfile || ShowVolumeSummary || StatisticsBox;
-
-			nakedEnabled = false;
-			for (int lv = 0; lv < LevelCount; lv++)
-			{
-				if (NakedTracked(lv))
-					nakedEnabled = true;
-			}
-
-			lock (sync)
-			{
-				ParseKeys(MergedSessions, mergedKeys);
-				ParseKeys(ExpandedSessions, expandedKeys);
-				groupingDirty = true;
-			}
+			return window;
 		}
 
 		// The time zone NinjaTrader shows its bars in (Tools > Options > General), which defaults to the computer's own.
@@ -917,63 +1002,78 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		#region Level settings
 
-		private bool LevelShown(int level)
+		// Levels of an ETH profile shown together with RTH profiles follow the "3b. ETH Profile Levels" settings
+		// (eth = true); everything else, and the levels that are not in that group, follow the shared settings.
+		private bool EthSet(TpoProfile p)
+		{
+			return bothKinds && ProfileIsEth(p);
+		}
+
+		private bool LevelShown(int level, bool eth)
 		{
 			switch (level)
 			{
-				case LvPoc: return PocShow;
-				case LvVah: return VahShow;
-				case LvVal: return ValShow;
+				case LvPoc: return eth ? EthPocShow : PocShow;
+				case LvVah: return eth ? EthVahShow : VahShow;
+				case LvVal: return eth ? EthValShow : ValShow;
 				case LvPoorHigh: return PoorHighShow;
 				case LvPoorLow: return PoorLowShow;
 				case LvVolPoc: return ShowVolumeProfile && VolPocShow;
 				case LvVolVah: return ShowVolumeProfile && VolVahShow;
 				case LvVolVal: return ShowVolumeProfile && VolValShow;
+				case LvHigh: return eth ? EthHighShow : HighShow;
+				case LvLow: return eth ? EthLowShow : LowShow;
 				default: return false;
 			}
 		}
 
-		private bool LevelNaked(int level)
+		private bool LevelNaked(int level, bool eth)
 		{
 			switch (level)
 			{
-				case LvPoc: return PocNaked;
-				case LvVah: return VahNaked;
-				case LvVal: return ValNaked;
+				case LvPoc: return eth ? EthPocNaked : PocNaked;
+				case LvVah: return eth ? EthVahNaked : VahNaked;
+				case LvVal: return eth ? EthValNaked : ValNaked;
 				case LvPoorHigh: return PoorHighNaked;
 				case LvPoorLow: return PoorLowNaked;
 				case LvVolPoc: return VolPocExtend;
 				case LvVolVah: return VolVahExtend;
 				case LvVolVal: return VolValExtend;
+				case LvHigh: return eth ? EthHighNaked : HighNaked;
+				case LvLow: return eth ? EthLowNaked : LowNaked;
 				default: return false;
 			}
 		}
 
-		private bool LevelScale(int level)
+		private bool LevelScale(int level, bool eth)
 		{
 			switch (level)
 			{
-				case LvPoc: return PocScale;
-				case LvVah: return VahScale;
-				case LvVal: return ValScale;
+				case LvPoc: return eth ? EthPocScale : PocScale;
+				case LvVah: return eth ? EthVahScale : VahScale;
+				case LvVal: return eth ? EthValScale : ValScale;
 				case LvPoorHigh: return PoorHighScale;
 				case LvPoorLow: return PoorLowScale;
 				case LvVolPoc: return VolPocScale;
 				case LvVolVah: return VolVahScale;
 				case LvVolVal: return VolValScale;
+				case LvHigh: return eth ? EthHighScale : HighScale;
+				case LvLow: return eth ? EthLowScale : LowScale;
 				default: return false;
 			}
 		}
 
-		private bool LevelLabel(int level)
+		private bool LevelLabel(int level, bool eth)
 		{
 			switch (level)
 			{
-				case LvPoc: return PocLabel;
-				case LvVah: return VahLabel;
-				case LvVal: return ValLabel;
+				case LvPoc: return eth ? EthPocLabel : PocLabel;
+				case LvVah: return eth ? EthVahLabel : VahLabel;
+				case LvVal: return eth ? EthValLabel : ValLabel;
 				case LvPoorHigh: return PoorHighLabel;
 				case LvPoorLow: return PoorLowLabel;
+				case LvHigh: return eth ? EthHighLabel : HighLabel;
+				case LvLow: return eth ? EthLowLabel : LowLabel;
 				default: return LevelPriceTags;
 			}
 		}
@@ -990,6 +1090,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				case LvVolPoc: return "vPOC";
 				case LvVolVah: return "vVAH";
 				case LvVolVal: return "vVAL";
+				case LvHigh: return "High";
+				case LvLow: return "Low";
 				default: return string.Empty;
 			}
 		}
@@ -1002,25 +1104,30 @@ namespace NinjaTrader.NinjaScript.Indicators
 			return text;
 		}
 
-		// Is this level followed after its profile ends, to find out whether price has traded at it again?
-		private bool NakedTracked(int level)
+		private bool NakedPocAll(bool eth)
 		{
-			if (level == LvPoc && NakedPocExtend)
+			return eth ? EthNakedPocExtend : NakedPocExtend;
+		}
+
+		// Is this level followed after its profile ends, to find out whether price has traded at it again?
+		private bool NakedTracked(int level, bool eth)
+		{
+			if (level == LvPoc && NakedPocAll(eth))
 				return true;
-			return LevelShown(level) && LevelNaked(level);
+			return LevelShown(level, eth) && LevelNaked(level, eth);
 		}
 
 		// Is a level that has been traded again still drawn, from its profile up to the bar that traded it?
 		// "Extend All Naked POCs" alone draws only the ones that are still untouched.
-		private bool NakedTrail(int level)
+		private bool NakedTrail(int level, bool eth)
 		{
-			return LevelShown(level) && LevelNaked(level);
+			return LevelShown(level, eth) && LevelNaked(level, eth);
 		}
 
 		// Is this profile's point of control still untouched and drawn to the right edge by "Extend All Naked POCs"?
 		private bool NakedPocOpen(TpoProfile p, TpoBuilt b)
 		{
-			if (!NakedPocExtend || p == null || p.Naked == null || !object.ReferenceEquals(p.NakedFor, b))
+			if (p == null || !NakedPocAll(EthSet(p)) || p.Naked == null || !object.ReferenceEquals(p.NakedFor, b))
 				return false;
 			NakedLevel level = p.Naked[LvPoc];
 			return level.Active && level.HasAfter && !level.Touched;
@@ -1031,29 +1138,36 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (lv == LvPoc && NakedPocOpen(p, b))
 				return true;
-			if (!NakedTracked(lv) || !LevelLabel(lv) || p == null || p.Naked == null || !object.ReferenceEquals(p.NakedFor, b))
+			if (!NakedTracked(lv, EthSet(p)) || !LevelLabel(lv, EthSet(p)) || p == null || p.Naked == null || !object.ReferenceEquals(p.NakedFor, b))
 				return false;
 			NakedLevel level = p.Naked[lv];
 			return level.Active && level.HasAfter && !level.Touched;
 		}
 
-		// Is this level extended from the prior session? Only the point of control and the value area edges can be;
-		// the range high and low have their own switches.
-		private bool PriorChosen(int level)
+		// Is this level extended from the prior session? The point of control, the value area edges and the
+		// range high and low can be.
+		private bool PriorChosen(int level, bool eth)
 		{
 			switch (level)
 			{
-				case LvPoc: return PriorPocExtend;
-				case LvVah: return PriorVahExtend;
-				case LvVal: return PriorValExtend;
+				case LvPoc: return eth ? EthPriorPocExtend : PriorPocExtend;
+				case LvVah: return eth ? EthPriorVahExtend : PriorVahExtend;
+				case LvVal: return eth ? EthPriorValExtend : PriorValExtend;
+				case LvHigh: return eth ? EthPriorHighExtend : PriorHighExtend;
+				case LvLow: return eth ? EthPriorLowExtend : PriorLowExtend;
 				default: return false;
 			}
 		}
 
-		// "pRTH VAH 31234.50" or "pETH POC 31180.25": which kind of session the extended level comes from.
-		private string PriorText(string name, double price)
+		private bool AnyPriorChosen(bool eth)
 		{
-			string text = (SessionHours == TpoMarketProfileTypes.TpoSessionHours.ETH ? "pETH " : "pRTH ") + name;
+			return PriorChosen(LvPoc, eth) || PriorChosen(LvVah, eth) || PriorChosen(LvVal, eth) || PriorChosen(LvHigh, eth) || PriorChosen(LvLow, eth);
+		}
+
+		// "pRTH VAH 31234.50" or "pETH POC 31180.25": which kind of session the extended level comes from.
+		private string PriorText(string name, double price, bool eth)
+		{
+			string text = (eth ? "pETH " : "pRTH ") + name;
 			if (LevelPriceTags)
 				text += " " + FormatPrice(price);
 			return text;
@@ -1104,6 +1218,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 					lineValue = baseEdge + b.VVal * rowSize;
 					price = RowBottomPrice(b, b.VVal);
 					return b.Vol != null && b.MaxVol > 0;
+				case LvHigh:
+					lineValue = b.High;
+					price = b.High;
+					return true;
+				case LvLow:
+					lineValue = b.Low;
+					price = b.Low;
+					return true;
 				default:
 					return false;
 			}
@@ -1221,7 +1343,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DateTime newYorkDay;
 			if (SessionHours == TpoMarketProfileTypes.TpoSessionHours.RTH)
 			{
-				newYorkSession = inSession;
+				newYorkSession = inSession && !windows[windowIndex].Eth;
 				newYorkDay = dayDate;
 			}
 			else
@@ -1233,8 +1355,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			lock (sync)
 			{
-				if (nakedEnabled)
-					RecordMinute(barIndex, barClose, high, low);
+				if (keepRanges)
+					RecordMinute(barIndex, barClose, high, low, newYorkSession);
 				FollowInitialBalance(newYorkOpenTime, barClose, high, low);
 				if (ShowGaps)
 					FollowGaps(newYorkSession, newYorkDay, barClose, open, high, low);
@@ -1454,14 +1576,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
-		// Called under lock(sync), and only while a naked level is followed. Keeps every minute bar's range,
+		// Called under lock(sync), and only while naked levels or single prints are followed. Keeps every minute bar's range,
 		// with a low/high summary per chunk for fast scanning. dataStamp changes whenever a range does.
-		private void RecordMinute(int barIndex, DateTime barClose, double high, double low)
+		private void RecordMinute(int barIndex, DateTime barClose, double high, double low, bool newYork)
 		{
 			RangeRec rec;
 			rec.Time = barClose;
 			rec.Low = low;
 			rec.High = high;
+			rec.NewYork = newYork;
 
 			if (allLastBar == barIndex && allMinutes.Count > 0)
 			{
@@ -1504,7 +1627,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				s.Index = sessions.Count;
 				s.OrderKey = order;
 				s.PeriodDate = periodDate;
-				s.Key = keyPrefix + periodDate.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+				s.Eth = windows[windowIndex].Eth;
+				s.Key = windows[windowIndex].KeyPrefix + periodDate.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
 				s.Anchor = dayAnchor;
 				s.FirstBarOpen = barOpen;
 				s.LastBarClose = barClose;
@@ -1655,13 +1779,24 @@ namespace NinjaTrader.NinjaScript.Indicators
 			int n = sessions.Count;
 			int rolling = Math.Max(1, RollingCompositeSessions);
 
+			// RTH and ETH sessions (when both are shown) are grouped each with their own kind only.
 			if (rolling > 1)
 			{
+				List<TpoSession> composite = new List<TpoSession>();
 				for (int i = 0; i < n; i++)
 				{
+					composite.Clear();
+					// ETH profiles are never combined with others.
+					int wanted = sessions[i].Eth ? 1 : rolling;
+					for (int k = i; k >= 0 && composite.Count < wanted; k--)
+					{
+						if (sessions[k].Eth == sessions[i].Eth)
+							composite.Add(sessions[k]);
+					}
+					composite.Reverse();
+
 					TpoProfile profile = new TpoProfile();
-					for (int k = Math.Max(0, i - rolling + 1); k <= i; k++)
-						profile.Sessions.Add(sessions[k]);
+					profile.Sessions.AddRange(composite);
 					profile.SpanStart = sessions[i];
 					list.Add(profile);
 				}
@@ -1669,20 +1804,34 @@ namespace NinjaTrader.NinjaScript.Indicators
 			else
 			{
 				int latest = Math.Max(0, MergeLatestCount);
-				TpoProfile current = null;
+				TpoProfile[] current = new TpoProfile[2];
+				int[] total = new int[2];
+				int[] seen = new int[2];
+				for (int i = 0; i < n; i++)
+					total[sessions[i].Eth ? 1 : 0]++;
 
 				for (int i = 0; i < n; i++)
 				{
 					TpoSession s = sessions[i];
-					bool join = i > 0 && current != null && (mergedKeys.Contains(s.Key) || (latest > 0 && i >= n - latest));
+					int kind = s.Eth ? 1 : 0;
+					// ETH profiles are never merged; they can only be expanded.
+					bool join = current[kind] != null && !s.Eth
+						&& (mergedKeys.Contains(s.Key) || (latest > 0 && seen[kind] >= total[kind] - latest));
 					if (!join)
 					{
-						current = new TpoProfile();
-						current.SpanStart = s;
-						list.Add(current);
+						current[kind] = new TpoProfile();
+						current[kind].SpanStart = s;
+						list.Add(current[kind]);
 					}
-					current.Sessions.Add(s);
+					current[kind].Sessions.Add(s);
+					seen[kind]++;
 				}
+
+				// In the order the profiles end, so that the last one is always the newest.
+				list.Sort(delegate(TpoProfile a, TpoProfile c)
+				{
+					return a.Sessions[a.Sessions.Count - 1].Index.CompareTo(c.Sessions[c.Sessions.Count - 1].Index);
+				});
 			}
 
 			// Keep the built data and level state of profiles whose composition did not change.
@@ -1704,6 +1853,42 @@ namespace NinjaTrader.NinjaScript.Indicators
 			profiles = list;
 			groupedSessionCount = n;
 			groupingDirty = false;
+		}
+
+		// Called under lock(sync). The session before this one of the same kind (RTH or ETH), or null.
+		private TpoSession PreviousOfKind(TpoSession s)
+		{
+			for (int k = s.Index - 1; k >= 0 && k < sessions.Count; k--)
+			{
+				if (sessions[k].Eth == s.Eth)
+					return sessions[k];
+			}
+			return null;
+		}
+
+		// Called under lock(sync). Average range of up to 20 sessions of the same kind before this one.
+		private double AverageRangeBefore(TpoSession s)
+		{
+			double sum = 0;
+			int used = 0;
+			int looked = 0;
+			for (int k = Math.Min(s.Index, sessions.Count) - 1; k >= 0 && looked < 20; k--)
+			{
+				if (sessions[k].Eth != s.Eth)
+					continue;
+				looked++;
+				if (sessions[k].High >= sessions[k].Low)
+				{
+					sum += sessions[k].High - sessions[k].Low;
+					used++;
+				}
+			}
+			return used > 0 ? sum / used : 0;
+		}
+
+		private static bool ProfileIsEth(TpoProfile p)
+		{
+			return p.Sessions.Count > 0 && p.Sessions[0].Eth;
 		}
 
 		private int ComputeRowTicks()
@@ -1774,6 +1959,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			b.RequestedRowTicks = rowTicks;
 			b.DayTypeText = string.Empty;
 			b.OpenTypeText = string.Empty;
+			b.Eth = p.Sessions.Count > 0 && p.Sessions[0].Eth;
 
 			int sessionCount = p.Sessions.Count;
 			int blockCount = 0;
@@ -2088,29 +2274,21 @@ namespace NinjaTrader.NinjaScript.Indicators
 				b.ExtensionUp = Math.Max(0, lastSession.High - lastSession.IbHigh);
 				b.ExtensionDown = Math.Max(0, lastSession.IbLow - lastSession.Low);
 
-				if (DayType)
+				// Day type and open type describe New York (RTH) sessions only.
+				if (DayType && !lastSession.Eth)
 				{
-					double sum = 0;
-					int used = 0;
-					for (int k = Math.Max(0, lastSession.Index - 20); k < lastSession.Index && k < sessions.Count; k++)
-					{
-						if (sessions[k].High >= sessions[k].Low)
-						{
-							sum += sessions[k].High - sessions[k].Low;
-							used++;
-						}
-					}
-					double averageRange = used > 0 ? sum / used : 0;
+					double averageRange = AverageRangeBefore(lastSession);
 					b.DayTypeText = ClassifyDay(lastSession.High, lastSession.Low, lastSession.Close, lastSession.IbHigh, lastSession.IbLow,
 						tickSize, averageRange, doubleDistribution);
 				}
 			}
 
-			if (OpenType && lastSession.HasOpening)
+			if (OpenType && lastSession.HasOpening && !lastSession.Eth)
 			{
-				bool hasPrior = lastSession.Index > 0 && lastSession.Index - 1 < sessions.Count;
-				double priorHigh = hasPrior ? sessions[lastSession.Index - 1].High : 0;
-				double priorLow = hasPrior ? sessions[lastSession.Index - 1].Low : 0;
+				TpoSession prior = PreviousOfKind(lastSession);
+				bool hasPrior = prior != null;
+				double priorHigh = hasPrior ? prior.High : 0;
+				double priorLow = hasPrior ? prior.Low : 0;
 				b.OpenTypeText = ClassifyOpen(lastSession.Open, lastSession.OpeningHigh, lastSession.OpeningLow, lastSession.OpeningClose,
 					hasPrior, priorHigh, priorLow);
 			}
@@ -2313,7 +2491,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				double lineValue;
 				double price;
 
-				if (!NakedTracked(lv) || !LevelValues(b, lv, out lineValue, out price))
+				if (!NakedTracked(lv, EthSet(p)) || !LevelValues(b, lv, out lineValue, out price))
 				{
 					level.Active = false;
 					continue;
@@ -2332,6 +2510,104 @@ namespace NinjaTrader.NinjaScript.Indicators
 				level.HasAfter = count > start;
 				if (!level.Touched)
 					ScanNaked(level);
+			}
+		}
+
+		// A single print: a row inside the profile (not in a tail run at either end) that only one block traded.
+		private static bool IsSinglePrint(TpoBuilt b, int r)
+		{
+			return b.Counts[r] == 1 && r >= b.BottomRun && r < b.RowCount - b.TopRun;
+		}
+
+		// Called under lock(sync). Marks the single prints that price has traded at again after the profile.
+		// RTH profiles only count New York session trading; ETH profiles count any trading, RTH or ETH.
+		private void UpdateSingles(TpoProfile p)
+		{
+			TpoBuilt b = p.Built;
+			if (b == null || b.RowCount == 0)
+				return;
+
+			int start = p.Sessions[p.Sessions.Count - 1].EndPos;
+			if (!object.ReferenceEquals(p.SinglesFor, b) || p.SinglesStart != start || p.SinglesDone == null)
+			{
+				p.SinglesFor = b;
+				p.SinglesStart = start;
+				p.SinglesPos = start;
+				p.SinglesStamp = -1;
+				p.SinglesDone = new bool[b.RowCount];
+				p.SinglesLeft = 0;
+				for (int r = 0; r < b.RowCount; r++)
+				{
+					if (IsSinglePrint(b, r))
+						p.SinglesLeft++;
+				}
+			}
+
+			if (p.SinglesLeft == 0 || p.SinglesStamp == dataStamp)
+				return;
+			p.SinglesStamp = dataStamp;
+
+			bool newYorkOnly = !ProfileIsEth(p);
+			double eps = tickSize * 0.01;
+			int count = allMinutes.Count;
+			double bandLow;
+			double bandHigh;
+			SinglesBand(p, b, out bandLow, out bandHigh);
+
+			int i = p.SinglesPos;
+			while (i < count && p.SinglesLeft > 0)
+			{
+				// Skip a whole chunk when nothing in it reaches the rows that are still waiting.
+				if (i % ChunkSize == 0 && i + ChunkSize <= count)
+				{
+					int chunk = i / ChunkSize;
+					if (chunkLow[chunk] > bandHigh + eps || chunkHigh[chunk] < bandLow - eps)
+					{
+						i += ChunkSize;
+						continue;
+					}
+				}
+
+				RangeRec m = allMinutes[i];
+				i++;
+				if (newYorkOnly && !m.NewYork)
+					continue;
+				if (m.Low > bandHigh + eps || m.High < bandLow - eps)
+					continue;
+
+				bool changed = false;
+				for (int r = 0; r < b.RowCount; r++)
+				{
+					if (p.SinglesDone[r] || !IsSinglePrint(b, r))
+						continue;
+					if (m.Low <= RowTopPrice(b, r) + eps && m.High >= RowBottomPrice(b, r) - eps)
+					{
+						p.SinglesDone[r] = true;
+						p.SinglesLeft--;
+						changed = true;
+					}
+				}
+				if (changed)
+					SinglesBand(p, b, out bandLow, out bandHigh);
+			}
+
+			// The newest minute may still be forming: look at it again next time.
+			p.SinglesPos = Math.Max(start, count - 1);
+		}
+
+		// Price span from the lowest to the highest single print that has not been traded at again.
+		private void SinglesBand(TpoProfile p, TpoBuilt b, out double low, out double high)
+		{
+			low = double.MaxValue;
+			high = double.MinValue;
+			for (int r = 0; r < b.RowCount; r++)
+			{
+				if (p.SinglesDone[r] || !IsSinglePrint(b, r))
+					continue;
+				double bottom = RowBottomPrice(b, r);
+				double top = RowTopPrice(b, r);
+				if (bottom < low) low = bottom;
+				if (top > high) high = top;
 			}
 		}
 
@@ -2439,7 +2715,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ProfileRef target = new ProfileRef();
 				target.IdentityKey = hit.SpanStart.Key;
 				target.FirstKey = hit.Sessions[0].Key;
-				target.CanMerge = !rolling && hit.Sessions[0].Index > 0;
+				target.CanMerge = !rolling && !hit.Sessions[0].Eth && PreviousOfKind(hit.Sessions[0]) != null;
 				if (!rolling)
 				{
 					for (int k = 1; k < hit.Sessions.Count; k++)
@@ -2764,6 +3040,27 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
+		private void SessionColours(bool eth, out float[][] period, out float[][] heat, out float[] solid)
+		{
+			float[] own = eth ? Channels(EthBlockBrush, Colors.LimeGreen) : Channels(RthBlockBrush, Colors.DodgerBlue);
+			float[] dark = new float[] { own[0] * 0.4f, own[1] * 0.4f, own[2] * 0.4f, own[3] };
+			float[] light = new float[] { own[0] + (1f - own[0]) * 0.6f, own[1] + (1f - own[1]) * 0.6f, own[2] + (1f - own[2]) * 0.6f, own[3] };
+			period = new float[][] { own, own };
+			heat = new float[][] { dark, own, light };
+			solid = own;
+		}
+
+		// Points the block colours at the set for this kind of profile.
+		private void UseColoursOf(bool eth)
+		{
+			bool ethSet = eth && dxPeriodEth != null;
+			curPeriod = ethSet ? dxPeriodEth : dxPeriod;
+			curHeat = ethSet ? dxHeatEth : dxHeat;
+			curSolid = ethSet ? dxSolidEth : dxSolid;
+			// Rows outside the value area have a colour of their own for ETH profiles.
+			curOutside = eth && dxOutsideEth != null ? dxOutsideEth : dxOutside;
+		}
+
 		private void CreateDeviceResources()
 		{
 			// Brushes belong to one render target: start clean and remember which target they were made for.
@@ -2786,14 +3083,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			else if (Palette == TpoMarketProfileTypes.TpoPalette.BySession)
 			{
 				// One colour per kind of session: dodger blue for RTH, green for ETH, unless changed in the Colors group.
-				float[] own = SessionHours == TpoMarketProfileTypes.TpoSessionHours.ETH
-					? Channels(EthBlockBrush, Colors.LimeGreen)
-					: Channels(RthBlockBrush, Colors.DodgerBlue);
-				float[] dark = new float[] { own[0] * 0.4f, own[1] * 0.4f, own[2] * 0.4f, own[3] };
-				float[] light = new float[] { own[0] + (1f - own[0]) * 0.6f, own[1] + (1f - own[1]) * 0.6f, own[2] + (1f - own[2]) * 0.6f, own[3] };
-				period = new float[][] { own, own };
-				heat = new float[][] { dark, own, light };
-				solid = own;
+				SessionColours(SessionHours == TpoMarketProfileTypes.TpoSessionHours.ETH, out period, out heat, out solid);
 			}
 			else
 			{
@@ -2804,11 +3094,21 @@ namespace NinjaTrader.NinjaScript.Indicators
 			dxHeat = MakeGradient(heat, blockOpacity);
 			dxSolid = MakeBrush(solid, blockOpacity);
 
+			// ETH profiles shown with RTH ones keep the ETH colour.
+			if (bothKinds && !CustomColors && Palette == TpoMarketProfileTypes.TpoPalette.BySession)
+			{
+				SessionColours(true, out period, out heat, out solid);
+				dxPeriodEth = MakeGradient(period, blockOpacity);
+				dxHeatEth = MakeGradient(heat, blockOpacity);
+				dxSolidEth = MakeBrush(solid, blockOpacity);
+			}
+			UseColoursOf(false);
+
 			float[] volumeLow = Channels(VolumeOutsideBrush, Colors.Gray);
 			float[] volumeHigh = Channels(VolumeBrush, Colors.SteelBlue);
 			dxVolGrade = MakeGradient(new float[][] { volumeLow, volumeHigh }, volumeOpacity);
 
-			Brush[] levelBrushes = new Brush[] { PocLineBrush, VahBrush, ValBrush, PoorHighBrush, PoorLowBrush, VolumePocBrush, VolumeVahBrush, VolumeValBrush };
+			Brush[] levelBrushes = new Brush[] { PocLineBrush, VahBrush, ValBrush, PoorHighBrush, PoorLowBrush, VolumePocBrush, VolumeVahBrush, VolumeValBrush, PriorHighBrush, PriorLowBrush };
 			dxLevel = new SharpDX.Direct2D1.SolidColorBrush[LevelCount];
 			for (int lv = 0; lv < LevelCount; lv++)
 			{
@@ -2818,6 +3118,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 
 			dxOutside = MakeBrush(OutsideValueAreaBrush, blockOpacity);
+			dxOutsideEth = MakeBrush(EthOutsideValueAreaBrush, blockOpacity);
+			curOutside = dxOutside;
 			dxPocRow = MakeBrush(PocRowBrush, blockOpacity);
 			dxSingle = MakeBrush(SinglePrintBrush, blockOpacity);
 			dxBuyTail = MakeBrush(BuyingTailBrush, blockOpacity);
@@ -2835,10 +3137,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			dxVolIn = MakeBrush(VolumeBrush, volumeOpacity);
 			dxVolOut = MakeBrush(VolumeOutsideBrush, volumeOpacity);
 			dxText = MakeBrush(TextBrush, 1f);
-			dxPriorHigh = MakeBrush(PriorHighBrush, 1f);
 			dxGapLine = MakeBrush(GapLineBrush, 1f);
 			dxGapArea = MakeBrush(GapAreaBrush, Math.Max(0, Math.Min(100, GapAreaOpacity)) / 100f);
-			dxPriorLow = MakeBrush(PriorLowBrush, 1f);
 			float bandOpacity = Math.Max(0, Math.Min(100, PriorHighlightOpacity)) / 100f;
 			dxBandVa = MakeBrush(PriorHighlightVaBrush, bandOpacity);
 			dxBandPoc = MakeBrush(PriorHighlightPocBrush, bandOpacity);
@@ -2899,10 +3199,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 			dxTarget = null;
 			DisposeBrushes(ref dxPeriod);
 			DisposeBrushes(ref dxHeat);
+			DisposeBrushes(ref dxPeriodEth);
+			DisposeBrushes(ref dxHeatEth);
+			DisposeBrush(ref dxSolidEth);
+			curPeriod = null;
+			curHeat = null;
+			curSolid = null;
 			DisposeBrushes(ref dxVolGrade);
 			DisposeBrushes(ref dxLevel);
 			DisposeBrush(ref dxSolid);
 			DisposeBrush(ref dxOutside);
+			DisposeBrush(ref dxOutsideEth);
+			curOutside = null;
 			DisposeBrush(ref dxPocRow);
 			DisposeBrush(ref dxSingle);
 			DisposeBrush(ref dxBuyTail);
@@ -2920,10 +3228,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DisposeBrush(ref dxVolIn);
 			DisposeBrush(ref dxVolOut);
 			DisposeBrush(ref dxText);
-			DisposeBrush(ref dxPriorHigh);
 			DisposeBrush(ref dxGapLine);
 			DisposeBrush(ref dxGapArea);
-			DisposeBrush(ref dxPriorLow);
 			DisposeBrush(ref dxBandVa);
 			DisposeBrush(ref dxBandPoc);
 			DisposeBrush(ref dxBandSingle);
@@ -3328,9 +3634,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 					if (SessionHours == TpoMarketProfileTypes.TpoSessionHours.RTH
 						&& SessionType == TpoMarketProfileTypes.TpoSessionType.Daily)
 					{
-						// Daily New York sessions: the latest session is the current one, and its own first
+						// Daily New York sessions: the latest of them is the current one, and its own first
 						// minutes are the initial balance. A new session at the open has none until they are over.
-						TpoSession current = sessions.Count > 0 ? sessions[sessions.Count - 1] : null;
+						TpoSession current = null;
+						for (int k = sessions.Count - 1; k >= 0 && current == null; k--)
+						{
+							if (!sessions[k].Eth)
+								current = sessions[k];
+						}
 						if (current != null && current.HasIb && current.IbHigh >= current.IbLow)
 						{
 							DateTime ibOver = current.Anchor.AddMinutes(InitialBalanceMinutes);
@@ -3375,16 +3686,54 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				lastSessionCount = sessions.Count;
 				if (sessions.Count > 0)
-					lastSession = sessions[sessions.Count - 1];
-				if (sessions.Count > 1)
 				{
-					priorSession = sessions[sessions.Count - 2];
-					priorEnd = priorSession.LastBarClose;
+					lastSession = sessions[sessions.Count - 1];
+					priorSession = PreviousOfKind(lastSession);
+					if (priorSession != null)
+						priorEnd = priorSession.LastBarClose;
 				}
 			}
 
 			if (snapshot.Length == 0)
 				return;
+
+			// For every profile, the next profile of the same kind (RTH or ETH), or -1.
+			if (nextSameBuffer.Length != snapshot.Length)
+			{
+				nextSameBuffer = new int[snapshot.Length];
+				carryBuffer = new int[snapshot.Length];
+			}
+			{
+				int nextRth = -1;
+				int nextEth = -1;
+				for (int i = snapshot.Length - 1; i >= 0; i--)
+				{
+					if (ProfileIsEth(snapshot[i]))
+					{
+						nextSameBuffer[i] = nextEth;
+						nextEth = i;
+					}
+					else
+					{
+						nextSameBuffer[i] = nextRth;
+						nextRth = i;
+					}
+				}
+			}
+
+			// Which profile each profile's chosen levels are carried across: the next profile of its own kind;
+			// with RTH and ETH shown together, an ETH profile's levels go across the RTH session of the same day
+			// (the next RTH profile) instead.
+			{
+				int nextRth = -1;
+				for (int i = snapshot.Length - 1; i >= 0; i--)
+				{
+					bool eth = ProfileIsEth(snapshot[i]);
+					carryBuffer[i] = (bothKinds && eth) ? nextRth : nextSameBuffer[i];
+					if (!eth)
+						nextRth = i;
+				}
+			}
 
 			// Step 2 (unlocked, chart access): where each profile sits on the bar axis.
 			// The developing session is given at least the width of the session before it.
@@ -3433,14 +3782,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				for (int i = 0; i < snapshot.Length; i++)
 				{
-					bool needed = nakedEnabled || snapshot[i].Visible || Banded(i, snapshot.Length)
-						|| (CarriesLevels(i, snapshot.Length) && snapshot[i + 1].Visible);
+					bool needed = nakedEnabled || snapshot[i].Visible || Banded(snapshot, i)
+						|| (CarriesLevels(snapshot, i) && snapshot[carryBuffer[i]].Visible);
 					if (!needed)
 						continue;
 
 					EnsureBuilt(snapshot[i], rowTicks);
 					if (nakedEnabled)
 						UpdateNaked(snapshot[i]);
+					if (ShowSinglePrints && snapshot[i].Visible)
+						UpdateSingles(snapshot[i]);
 				}
 			}
 
@@ -3451,8 +3802,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			for (int i = 0; i < snapshot.Length; i++)
 			{
 				TpoProfile p = snapshot[i];
-				TpoProfile next = i + 1 < snapshot.Length ? snapshot[i + 1] : null;
-				bool carries = CarriesLevels(i, snapshot.Length);
+				bool carries = CarriesLevels(snapshot, i);
+				TpoProfile next = carries ? snapshot[carryBuffer[i]] : null;
 				bool levelsOnly = !p.Visible && carries && next.Visible;
 
 				if (!p.Visible && !levelsOnly)
@@ -3479,8 +3830,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 					}
 				}
 
-				drawingBanded = Banded(i, snapshot.Length);
-				DrawProfile(chartControl, chartScale, p, b, i == snapshot.Length - 1, xLeft, xRight, xPriorEnd, hasNext, levelsOnly, barCount, lastIdx, barDistance);
+				drawingBanded = Banded(snapshot, i);
+				UseColoursOf(ProfileIsEth(p));
+				DrawProfile(chartControl, chartScale, p, b, nextSameBuffer[i] < 0, xLeft, xRight, xPriorEnd, hasNext, levelsOnly, barCount, lastIdx, barDistance);
 			}
 			drawingBanded = false;
 
@@ -3491,7 +3843,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				List<BandLevel> wanted = PriorHighlightGlobal ? new List<BandLevel>() : null;
 				for (int i = 0; i < snapshot.Length; i++)
 				{
-					if (!Banded(i, snapshot.Length))
+					if (!Banded(snapshot, i))
 						continue;
 					TpoProfile p = snapshot[i];
 					TpoBuilt b = p.Built;
@@ -3504,7 +3856,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 					foreach (int lv in BandLevels)
 					{
-						if (!PriorChosen(lv))
+						if (!PriorChosen(lv, false))
 							continue;
 						double lineValue;
 						double price;
@@ -3528,7 +3880,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 							HLine(xStart, clipRight, y, lv == LvPoc ? dxBandPoc : dxBandVa, Math.Max(1, PriorHighlightWidth), null);
 						// An untouched naked level is labelled at the right edge by the naked pass
 						if (!NakedOpen(p, b, lv))
-							DrawLabel(PriorText(LevelName(lv), price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
+							DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
 					}
 
 					// Single prints: one band through the middle of each run of single-print rows inside the profile
@@ -3579,7 +3931,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						NakedLevel level = p.Naked[lv];
 						if (!level.Active || !level.HasAfter)
 							continue;
-						if (level.Touched && !NakedTrail(lv))
+						if (level.Touched && !NakedTrail(lv, EthSet(p)))
 							continue;
 
 						float xEnd = clipRight;
@@ -3609,10 +3961,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 							continue;
 
 						// Every untouched point of control is named after its kind of session: "pRTH nPOC" or "pETH nPOC".
-						if (lv == LvPoc && NakedPocExtend)
-							DrawLabel(PriorText("nPOC", price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
-						else if (LevelLabel(lv))
-							DrawLabel(LevelText(lv, price, "n"), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
+						if (lv == LvPoc && NakedPocAll(EthSet(p)))
+							DrawLabel(PriorText("nPOC", price, ProfileIsEth(p)), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
+						else if (LevelLabel(lv, EthSet(p)))
+							DrawLabel(LevelText(lv, price, "n"), clipRight - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
 					}
 				}
 			}
@@ -3627,8 +3979,22 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (gapCount > 0)
 				DrawGaps(chartControl, chartScale, gapCount, barCount, lastIdx, barDistance, Math.Max(xProfileEnd, xNewestBar));
 
+			// With the ETH profiles added, the initial balance belongs to the newest RTH profile.
+			float xIbProfileEnd = xProfileEnd;
+			if (bothKinds)
+			{
+				for (int i = snapshot.Length - 1; i >= 0; i--)
+				{
+					if (!ProfileIsEth(snapshot[i]))
+					{
+						xIbProfileEnd = XOfIndex(chartControl, snapshot[i].GeoEnd, lastIdx, barDistance) - barDistance * 0.5f;
+						break;
+					}
+				}
+			}
+
 			if (ibReady)
-				DrawInitialBalance(chartControl, chartScale, ibTop, ibBottom, ibFrom, ibMark, barCount, lastIdx, barDistance, xProfileEnd, xNewestBar);
+				DrawInitialBalance(chartControl, chartScale, ibTop, ibBottom, ibFrom, ibMark, barCount, lastIdx, barDistance, xIbProfileEnd, xNewestBar);
 		}
 
 		// Opening gaps. Each one is a line at the prior session's high or low, from the New York open that
@@ -3759,15 +4125,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DrawLabel(lowText, xEnd - 4f, yLow, dxIb, true, 1, labelFormat);
 		}
 
-		// Does profile 'index' carry its chosen levels across the profile after it?
-		// Normally only the profile just before the current (last) one does; optionally every profile.
-		private bool CarriesLevels(int index, int count)
+		// Does profile 'index' carry its chosen levels across the profile after it (carryBuffer: the next one of
+		// its kind, or for an ETH profile shown with RTH profiles the RTH session of the same day)?
+		// Normally only the profile whose target is the newest of its kind does; optionally every profile.
+		private bool CarriesLevels(TpoProfile[] snapshot, int index)
 		{
-			if (index + 1 >= count)
+			int next = carryBuffer[index];
+			if (next < 0)
 				return false;
-			if (!PriorPocExtend && !PriorVahExtend && !PriorValExtend && !PriorHighExtend && !PriorLowExtend)
+			if (!AnyPriorChosen(EthSet(snapshot[index])))
 				return false;
-			return PriorSessionLevels || index == count - 2;
+			return PriorSessionLevels || nextSameBuffer[next] < 0;
 		}
 
 		private static bool SameBands(List<BandLevel> a, List<BandLevel> b)
@@ -3815,10 +4183,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 			bandShown = new HashSet<string>(bandDrawn.Keys);
 		}
 
-		// Is profile 'index' one of the last "Highlight Sessions Back" sessions before the current one?
-		private bool Banded(int index, int count)
+		// Is profile 'index' one of the last "Highlight Sessions Back" sessions before the current one of its kind?
+		// ETH profiles shown with RTH profiles are never highlighted. Needs nextSameBuffer (set in OnRender).
+		private bool Banded(TpoProfile[] snapshot, int index)
 		{
-			return PriorHighlight && index + 1 < count && index >= count - 1 - Math.Max(1, PriorHighlightSessions);
+			if (!PriorHighlight || EthSet(snapshot[index]))
+				return false;
+			int later = 0;
+			for (int k = nextSameBuffer[index]; k >= 0; k = nextSameBuffer[k])
+				if (++later > Math.Max(1, PriorHighlightSessions))
+					return false;
+			return later >= 1;
 		}
 
 		private void DrawProfile(ChartControl chartControl, ChartScale chartScale, TpoProfile p, TpoBuilt b, bool isLatest,
@@ -3843,6 +4218,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			float rowPixels = Math.Abs(edge[0] - edge[n]) / n;
 
 			bool expanded = p.SpanStart != null && expandedKeys.Contains(p.SpanStart.Key);
+			bool[] singlesDone = object.ReferenceEquals(p.SinglesFor, b) ? p.SinglesDone : null;
+			bool ethLevels = EthSet(p);
 			bool volumeOn = ShowVolumeProfile && b.Vol != null && b.MaxVol > 0;
 			float volumeWidth = volumeOn ? available * (VolumeWidthPercent / 100f) : 0f;
 			float xTpo = xLeft;
@@ -3901,7 +4278,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				if (expanded)
 				{
 					ResolveBlockBars(b, barCount);
-					DrawExpanded(chartControl, b, edge, lastIdx, barDistance, rowPixels, histogram, wantsLetters);
+					DrawExpanded(chartControl, b, edge, lastIdx, barDistance, rowPixels, histogram, wantsLetters, singlesDone);
 				}
 				else
 				{
@@ -3918,7 +4295,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						if (top > clipBottom || top + height < clipTop)
 							continue;
 
-						SharpDX.Direct2D1.SolidColorBrush rowBrush = RowBrush(b, r);
+						SharpDX.Direct2D1.SolidColorBrush rowBrush = RowBrush(b, r, singlesDone);
 
 						float cellHeight = height - gap;
 						if (cellHeight < 1f) cellHeight = 1f;
@@ -3929,13 +4306,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 						{
 							// No gaps and no letters: draw each run of same-coloured cells as one rectangle.
 							int runStart = c0;
-							SharpDX.Direct2D1.SolidColorBrush runBrush = rowBrush != null ? rowBrush : dxPeriod[b.CellShade[c0]];
+							SharpDX.Direct2D1.SolidColorBrush runBrush = rowBrush != null ? rowBrush : curPeriod[b.CellShade[c0]];
 
 							for (int c = c0 + 1; c <= c1; c++)
 							{
 								SharpDX.Direct2D1.SolidColorBrush brush = null;
 								if (c < c1)
-									brush = rowBrush != null ? rowBrush : dxPeriod[b.CellShade[c]];
+									brush = rowBrush != null ? rowBrush : curPeriod[b.CellShade[c]];
 
 								if (c == c1 || !object.ReferenceEquals(brush, runBrush))
 								{
@@ -3957,7 +4334,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 								if (x + cellWidth < clipLeft)
 									continue;
 
-								SharpDX.Direct2D1.SolidColorBrush brush = rowBrush != null ? rowBrush : dxPeriod[b.CellShade[c]];
+								SharpDX.Direct2D1.SolidColorBrush brush = rowBrush != null ? rowBrush : curPeriod[b.CellShade[c]];
 
 								if (fill)
 									FillRect(x, top, cellDrawWidth, cellHeight, brush);
@@ -3997,16 +4374,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 				{
 					double lineValue;
 					double price;
-					if (!LevelShown(lv) || !LevelValues(b, lv, out lineValue, out price))
+					if (!LevelShown(lv, ethLevels) || !LevelValues(b, lv, out lineValue, out price))
 						continue;
 
 					bool isHigh = lv == LvPoorHigh;
 					float y = isHigh ? edge[n] - 2f : edge[0] + 2f;
 					float w = expanded ? Math.Max(xUse - xTpo, 6f) : Math.Max(cellWidth * b.Counts[isHigh ? n - 1 : 0], 6f);
 					HLine(xTpo, xTpo + w, y, dxLevel[lv], Math.Max(2f, OtherWidth()), null);
-					if (LevelLabel(lv))
+					if (LevelLabel(lv, ethLevels))
 						DrawLabel(LevelText(lv, price, string.Empty), xTpo + w + 4f, y, dxLevel[lv], false, 0, labelFormat);
-					if (isLatest && LevelScale(lv))
+					if (isLatest && LevelScale(lv, ethLevels))
 						DrawScaleTag(lv, price, chartScale.GetYByValue(lineValue));
 					if (!isHigh)
 						annotationTop += 4f;
@@ -4035,7 +4412,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 
 				// Developing levels and the one-time-framing ribbon follow the time axis.
-				if (DevelopingPoc || DevelopingVa || OneTimeFraming)
+				// One-time framing is read for RTH profiles only.
+				bool framing = OneTimeFraming && !b.Eth;
+				if (DevelopingPoc || DevelopingVa || framing)
 				{
 					ResolveBlockBars(b, barCount);
 
@@ -4047,7 +4426,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 					if (DevelopingPoc)
 						DrawDeveloping(chartControl, b, edge, 0, lastIdx, barDistance, dxDevPoc);
 
-					if (OneTimeFraming)
+					if (framing)
 					{
 						for (int k = 0; k < b.BlockOtf.Length; k++)
 						{
@@ -4073,16 +4452,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 				p.HitRight = expanded ? xRight : Math.Max(xRight, xTpo + b.MaxCount * cellWidth);
 			}
 
-			// Levels: point of control, value area and the volume levels. A level chosen under "Extend Prior ..."
-			// runs on across the following profile even when its own line is switched off.
+			// Levels: point of control, value area, range high and low, and the volume levels. A level chosen under
+			// "Extend Prior ..." runs on across the following profile even when its own line is switched off.
 			for (int lv = 0; lv < LevelCount; lv++)
 			{
 				if (lv == LvPoorHigh || lv == LvPoorLow)
 					continue;
 
-				bool shown = LevelShown(lv) && !levelsOnly;
-				// A highlighted session's POC / VAH / VAL is drawn as a band instead
-				bool carried = hasNext && PriorChosen(lv) && !(drawingBanded && (lv == LvPoc || lv == LvVah || lv == LvVal));
+				bool shown = LevelShown(lv, ethLevels) && !levelsOnly;
+				bool carried = hasNext && PriorChosen(lv, ethLevels)
+					&& !(drawingBanded && (lv == LvPoc || lv == LvVah || lv == LvVal));   // a highlighted session's POC / VAH / VAL is drawn as a band instead
 				if (!shown && !carried)
 					continue;
 
@@ -4091,11 +4470,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 				if (!LevelValues(b, lv, out lineValue, out price))
 					continue;
 
-				bool isVolume = lv >= LvVolPoc;
+				bool isVolume = lv >= LvVolPoc && lv <= LvVolVal;
 				float y = chartScale.GetYByValue(lineValue);
 				HLine(shown ? xLeft : xRight, carried ? xPriorEnd : xUse, y, dxLevel[lv], LevelWidth(lv), LevelStyle(lv));
 
-				if (shown && LevelLabel(lv))
+				if (shown && LevelLabel(lv, ethLevels))
 				{
 					if (isVolume)
 						DrawLabel(LevelText(lv, price, string.Empty), xUse - 4f, y, dxLevel[lv], true, lv == LvVolVal ? 1 : -1, labelFormat);
@@ -4105,31 +4484,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				// An untouched prior POC is labelled once, as "nPOC" at the right edge, by the naked pass.
 				if (carried && !(lv == LvPoc && NakedPocOpen(p, b)))
-					DrawLabel(PriorText(LevelName(lv), price), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, -1, labelFormat);
+					DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
 
-				if (isLatest && shown && LevelScale(lv))
+				if (isLatest && shown && LevelScale(lv, ethLevels))
 					DrawScaleTag(lv, price, y);
-			}
-
-			// The session's range high and low can be extended across the following profile as well.
-			if (hasNext && (PriorHighExtend || PriorLowExtend))
-			{
-				SharpDX.Direct2D1.StrokeStyle style = LevelStyle(LvPoc);
-				float width = Math.Max(1, LineWidth);
-				float labelX = Math.Min(xPriorEnd, clipRight) - 4f;
-
-				if (PriorHighExtend)
-				{
-					float y = chartScale.GetYByValue(b.High);
-					HLine(xRight, xPriorEnd, y, dxPriorHigh, width, style);
-					DrawLabel(PriorText("High", b.High), labelX, y, dxPriorHigh, true, -1, labelFormat);
-				}
-				if (PriorLowExtend)
-				{
-					float y = chartScale.GetYByValue(b.Low);
-					HLine(xRight, xPriorEnd, y, dxPriorLow, width, style);
-					DrawLabel(PriorText("Low", b.Low), labelX, y, dxPriorLow, true, 1, labelFormat);
-				}
 			}
 
 			// Annotation block under the profile.
@@ -4158,7 +4516,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		// Colour that applies to a whole row, or null when each block keeps its own period colour.
-		private SharpDX.Direct2D1.SolidColorBrush RowBrush(TpoBuilt b, int r)
+		// singlesDone: per row, single prints traded at again after the profile (null when not known).
+		private SharpDX.Direct2D1.SolidColorBrush RowBrush(TpoBuilt b, int r, bool[] singlesDone)
 		{
 			int n = b.RowCount;
 			if (HighlightPocRow && r == b.Poc)
@@ -4167,20 +4526,21 @@ namespace NinjaTrader.NinjaScript.Indicators
 				return dxSellTail;
 			if (ShowTails && b.BottomTail > 0 && r < b.BottomTail)
 				return dxBuyTail;
-			if (ShowSinglePrints && b.Counts[r] == 1 && r >= b.BottomRun && r < n - b.TopRun)
+			// A single print that price has traded at again is drawn like any other row of its profile.
+			if (ShowSinglePrints && IsSinglePrint(b, r) && !(singlesDone != null && r < singlesDone.Length && singlesDone[r]))
 				return dxSingle;
 			if (OutsideVaColors && (r < b.Val || r > b.Vah))
-				return dxOutside;
+				return curOutside;
 			if (BlockColorMode == TpoMarketProfileTypes.TpoBlockColorMode.Heat)
-				return dxHeat[ShadeOf(b.MaxCount > 1 ? (double)(b.Counts[r] - 1) / (b.MaxCount - 1) : 1.0)];
+				return curHeat[ShadeOf(b.MaxCount > 1 ? (double)(b.Counts[r] - 1) / (b.MaxCount - 1) : 1.0)];
 			if (BlockColorMode == TpoMarketProfileTypes.TpoBlockColorMode.Solid)
-				return dxSolid;
+				return curSolid;
 			return null;
 		}
 
 		// Expanded view: every block is drawn as a column over the bars of its own time slice.
 		private void DrawExpanded(ChartControl chartControl, TpoBuilt b, float[] edge, int lastIdx, float barDistance, float rowPixels,
-			bool histogram, bool wantsLetters)
+			bool histogram, bool wantsLetters, bool[] singlesDone)
 		{
 			if (b.BlockIdx0 == null)
 				return;
@@ -4207,7 +4567,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				if (fontSize < 6) fontSize = 6;
 				if (fontSize > MaxLetterFont) fontSize = MaxLetterFont;
 
-				SharpDX.Direct2D1.SolidColorBrush own = dxPeriod[b.BlockShade[k]];
+				SharpDX.Direct2D1.SolidColorBrush own = curPeriod[b.BlockShade[k]];
 				int r0 = b.BlockRow0[k];
 				int r1 = b.BlockRow1[k];
 
@@ -4215,7 +4575,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				{
 					// No gaps and no letters: one rectangle per run of same-coloured rows.
 					int runStart = r0;
-					SharpDX.Direct2D1.SolidColorBrush runBrush = RowBrush(b, r0);
+					SharpDX.Direct2D1.SolidColorBrush runBrush = RowBrush(b, r0, singlesDone);
 					if (runBrush == null) runBrush = own;
 
 					for (int r = r0 + 1; r <= r1 + 1; r++)
@@ -4223,7 +4583,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						SharpDX.Direct2D1.SolidColorBrush brush = null;
 						if (r <= r1)
 						{
-							brush = RowBrush(b, r);
+							brush = RowBrush(b, r, singlesDone);
 							if (brush == null) brush = own;
 						}
 
@@ -4248,7 +4608,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						if (top > clipBottom || top + height < clipTop)
 							continue;
 
-						SharpDX.Direct2D1.SolidColorBrush brush = RowBrush(b, r);
+						SharpDX.Direct2D1.SolidColorBrush brush = RowBrush(b, r, singlesDone);
 						if (brush == null) brush = own;
 
 						if (fill)
@@ -4479,7 +4839,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				text.Append(", down ").Append(TicksBetween(b.ExtensionDown, 0).ToString(CultureInfo.CurrentCulture)).Append(" ticks\n");
 			}
 
-			if (OneTimeFraming)
+			if (OneTimeFraming && !b.Eth)
 			{
 				text.Append("One-time framing: ");
 				if (b.OtfDirection == 0)
@@ -4602,19 +4962,22 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Trading Hours", Description = "RTH: regular trading hours, the New York session, 09:30 to 16:00 New York time. ETH: the overnight session, Asia and London, 18:00 to 09:30 New York time. The indicator converts from the time zone NinjaTrader is set to, so the sessions land at the right local time on your chart.", GroupName = "1. General", Order = 2)]
 		public TpoMarketProfileTypes.TpoSessionHours SessionHours { get; set; }
 
-		[Display(Name = "Block Size", Description = "The time slice each block represents: 5 minutes, 30 minutes, 1 hour or 4 hours.", GroupName = "1. General", Order = 3)]
+		[Display(Name = "Add ETH Profiles", Description = "With Trading Hours set to RTH and daily sessions: draw the ETH (overnight) profiles on the same chart as well, each with its own colour, prior levels (pETH) and single print rule. The ETH levels extend only to the next ETH profile, the RTH levels only to the next RTH profile. ETH profiles have no day type or open type and can be expanded but not merged.", GroupName = "1. General", Order = 3)]
+		public bool AddEthProfiles { get; set; }
+
+		[Display(Name = "Block Size", Description = "The time slice each block represents: 5 minutes, 30 minutes, 1 hour or 4 hours.", GroupName = "1. General", Order = 4)]
 		public TpoMarketProfileTypes.TpoBlockSize BlockSize { get; set; }
 
 		[Range(1, 1000000)]
-		[Display(Name = "Ticks Per Bar", Description = "Price height of one profile row in ticks. 10 ticks is 2.50 points on NQ.", GroupName = "1. General", Order = 4)]
+		[Display(Name = "Ticks Per Bar", Description = "Price height of one profile row in ticks. 10 ticks is 2.50 points on NQ.", GroupName = "1. General", Order = 5)]
 		public int TicksPerRow { get; set; }
 
 		[Range(0, 2000)]
-		[Display(Name = "Profile Spacing", Description = "Empty space in pixels kept at the right end of every profile.", GroupName = "1. General", Order = 5)]
+		[Display(Name = "Profile Spacing", Description = "Empty space in pixels kept at the right end of every profile.", GroupName = "1. General", Order = 6)]
 		public int ProfileSpacing { get; set; }
 
 		[Range(1, 500)]
-		[Display(Name = "Rolling Composite Sessions", Description = "Number of sessions combined in every profile: each session is drawn together with the sessions before it. 1 draws every session on its own. Merging is switched off above 1.", GroupName = "1. General", Order = 6)]
+		[Display(Name = "Rolling Composite Sessions", Description = "Number of sessions combined in every RTH profile: each session is drawn together with the sessions before it. 1 draws every session on its own. Merging is switched off above 1. ETH profiles are never combined.", GroupName = "1. General", Order = 7)]
 		public int RollingCompositeSessions { get; set; }
 
 		#endregion
@@ -4716,39 +5079,63 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "VAL: Scale", Description = "Show a price tag for the latest profile's level at the right edge, next to the price scale.", GroupName = "3. Profile - Core Levels", Order = 14)]
 		public bool ValScale { get; set; }
 
+		[Display(Name = "Range High", Description = "Draw a line at the session's high.", GroupName = "3. Profile - Core Levels", Order = 15)]
+		public bool HighShow { get; set; }
+
+		[Display(Name = "Range High: Label", Description = "Write the level name next to the line.", GroupName = "3. Profile - Core Levels", Order = 16)]
+		public bool HighLabel { get; set; }
+
+		[Display(Name = "Range High: Naked", Description = "Extend the line to the right until price trades at it again.", GroupName = "3. Profile - Core Levels", Order = 17)]
+		public bool HighNaked { get; set; }
+
+		[Display(Name = "Range High: Scale", Description = "Show a price tag for the latest profile's level at the right edge, next to the price scale.", GroupName = "3. Profile - Core Levels", Order = 18)]
+		public bool HighScale { get; set; }
+
+		[Display(Name = "Range Low", Description = "Draw a line at the session's low.", GroupName = "3. Profile - Core Levels", Order = 19)]
+		public bool LowShow { get; set; }
+
+		[Display(Name = "Range Low: Label", Description = "Write the level name next to the line.", GroupName = "3. Profile - Core Levels", Order = 20)]
+		public bool LowLabel { get; set; }
+
+		[Display(Name = "Range Low: Naked", Description = "Extend the line to the right until price trades at it again.", GroupName = "3. Profile - Core Levels", Order = 21)]
+		public bool LowNaked { get; set; }
+
+		[Display(Name = "Range Low: Scale", Description = "Show a price tag for the latest profile's level at the right edge, next to the price scale.", GroupName = "3. Profile - Core Levels", Order = 22)]
+		public bool LowScale { get; set; }
+
 		[Range(1, 10)]
-		[Display(Name = "Line Thickness", Description = "Thickness in pixels of every other line: value area high and low, their extensions into the next session, prior high and low, naked levels, volume levels, poor high and low markers, developing lines and range extension. The point of control and the initial balance have their own thickness.", GroupName = "3. Profile - Core Levels", Order = 15)]
+		[Display(Name = "Line Thickness", Description = "Thickness in pixels of every other line: value area high and low, range high and low, their extensions into the next session, naked levels, volume levels, poor high and low markers, developing lines and range extension. The point of control and the initial balance have their own thickness.", GroupName = "3. Profile - Core Levels", Order = 23)]
 		public int LineWidth { get; set; }
 
-		[Display(Name = "Fill Value Area", Description = "Shade the area between value area low and value area high.", GroupName = "3. Profile - Core Levels", Order = 16)]
+		[Display(Name = "Fill Value Area", Description = "Shade the area between value area low and value area high.", GroupName = "3. Profile - Core Levels", Order = 24)]
 		public bool FillValueArea { get; set; }
 
 		[Range(0, 100)]
-		[Display(Name = "Value Area Fill Opacity %", Description = "Opacity of the value area shading.", GroupName = "3. Profile - Core Levels", Order = 17)]
+		[Display(Name = "Value Area Fill Opacity %", Description = "Opacity of the value area shading.", GroupName = "3. Profile - Core Levels", Order = 25)]
 		public int ValueAreaFillOpacity { get; set; }
 
-		[Display(Name = "Level Price Tags", Description = "Add the price to every level label.", GroupName = "3. Profile - Core Levels", Order = 18)]
+		[Display(Name = "Level Price Tags", Description = "Add the price to every level label.", GroupName = "3. Profile - Core Levels", Order = 26)]
 		public bool LevelPriceTags { get; set; }
 
-		[Display(Name = "Extend Prior POC", Description = "Extend the previous session's point of control across the current session, labelled pRTH POC or pETH POC.", GroupName = "3. Profile - Core Levels", Order = 19)]
+		[Display(Name = "Extend Prior POC", Description = "Extend the previous session's point of control across the current session, labelled pRTH POC or pETH POC.", GroupName = "3. Profile - Core Levels", Order = 27)]
 		public bool PriorPocExtend { get; set; }
 
-		[Display(Name = "Extend Prior VAH", Description = "Extend the previous session's value area high across the current session, labelled pRTH VAH or pETH VAH.", GroupName = "3. Profile - Core Levels", Order = 20)]
+		[Display(Name = "Extend Prior VAH", Description = "Extend the previous session's value area high across the current session, labelled pRTH VAH or pETH VAH.", GroupName = "3. Profile - Core Levels", Order = 28)]
 		public bool PriorVahExtend { get; set; }
 
-		[Display(Name = "Extend Prior VAL", Description = "Extend the previous session's value area low across the current session, labelled pRTH VAL or pETH VAL.", GroupName = "3. Profile - Core Levels", Order = 21)]
+		[Display(Name = "Extend Prior VAL", Description = "Extend the previous session's value area low across the current session, labelled pRTH VAL or pETH VAL.", GroupName = "3. Profile - Core Levels", Order = 29)]
 		public bool PriorValExtend { get; set; }
 
-		[Display(Name = "Extend Prior High", Description = "Extend the previous session's range high across the current session, labelled pRTH High or pETH High.", GroupName = "3. Profile - Core Levels", Order = 22)]
+		[Display(Name = "Extend Prior High", Description = "Extend the previous session's range high across the current session, labelled pRTH High or pETH High.", GroupName = "3. Profile - Core Levels", Order = 30)]
 		public bool PriorHighExtend { get; set; }
 
-		[Display(Name = "Extend Prior Low", Description = "Extend the previous session's range low across the current session, labelled pRTH Low or pETH Low.", GroupName = "3. Profile - Core Levels", Order = 23)]
+		[Display(Name = "Extend Prior Low", Description = "Extend the previous session's range low across the current session, labelled pRTH Low or pETH Low.", GroupName = "3. Profile - Core Levels", Order = 31)]
 		public bool PriorLowExtend { get; set; }
 
-		[Display(Name = "Extend From Every Profile", Description = "Off: only the session just before the current one is extended. On: every profile's chosen levels are carried across the profile after it, through the whole chart.", GroupName = "3. Profile - Core Levels", Order = 24)]
+		[Display(Name = "Extend From Every Profile", Description = "Off: only the session just before the current one is extended. On: every profile's chosen levels are carried across the profile after it, through the whole chart.", GroupName = "3. Profile - Core Levels", Order = 32)]
 		public bool PriorSessionLevels { get; set; }
 
-		[Display(Name = "Extend All Naked POCs", Description = "Extend the point of control of every earlier session that price has not traded at since, all the way to the right edge of the chart, labelled pRTH nPOC or pETH nPOC. A line disappears as soon as price trades at it. Works with the POC line itself switched off.", GroupName = "3. Profile - Core Levels", Order = 25)]
+		[Display(Name = "Extend All Naked POCs", Description = "Extend the point of control of every earlier session that price has not traded at since, all the way to the right edge of the chart, labelled pRTH nPOC or pETH nPOC. A line disappears as soon as price trades at it. Works with the POC line itself switched off.", GroupName = "3. Profile - Core Levels", Order = 33)]
 		public bool NakedPocExtend { get; set; }
 
 		[Display(Name = "Highlight Prior Levels", Description = "Draw the chosen prior POC / VAH / VAL (Extend Prior ...) of the last few sessions as wide see-through bands, from their own profile to the right edge.", GroupName = "3. Profile - Core Levels", Order = 26)]
@@ -4807,6 +5194,91 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		#endregion
 
+		#region Properties: 3b. ETH Profile Levels
+
+		// Used for the ETH profiles drawn by "Add ETH Profiles". Line colours, thickness, style, price tags,
+		// Value Area % and "Extend From Every Profile" are shared with group 3.
+
+		[Display(Name = "ETH POC", Description = "Draw the point of control line on ETH profiles shown with RTH profiles.", GroupName = "3b. ETH Profile Levels", Order = 1)]
+		public bool EthPocShow { get; set; }
+
+		[Display(Name = "ETH POC: Label", Description = "Write the level name next to the line on ETH profiles.", GroupName = "3b. ETH Profile Levels", Order = 2)]
+		public bool EthPocLabel { get; set; }
+
+		[Display(Name = "ETH POC: Naked", Description = "Extend the ETH line to the right until price trades at it again.", GroupName = "3b. ETH Profile Levels", Order = 3)]
+		public bool EthPocNaked { get; set; }
+
+		[Display(Name = "ETH POC: Scale", Description = "Show a price tag for the newest ETH profile's level at the right edge, next to the price scale.", GroupName = "3b. ETH Profile Levels", Order = 4)]
+		public bool EthPocScale { get; set; }
+
+		[Display(Name = "ETH VAH", Description = "Draw the value area high line on ETH profiles shown with RTH profiles.", GroupName = "3b. ETH Profile Levels", Order = 5)]
+		public bool EthVahShow { get; set; }
+
+		[Display(Name = "ETH VAH: Label", Description = "Write the level name next to the line on ETH profiles.", GroupName = "3b. ETH Profile Levels", Order = 6)]
+		public bool EthVahLabel { get; set; }
+
+		[Display(Name = "ETH VAH: Naked", Description = "Extend the ETH line to the right until price trades at it again.", GroupName = "3b. ETH Profile Levels", Order = 7)]
+		public bool EthVahNaked { get; set; }
+
+		[Display(Name = "ETH VAH: Scale", Description = "Show a price tag for the newest ETH profile's level at the right edge, next to the price scale.", GroupName = "3b. ETH Profile Levels", Order = 8)]
+		public bool EthVahScale { get; set; }
+
+		[Display(Name = "ETH VAL", Description = "Draw the value area low line on ETH profiles shown with RTH profiles.", GroupName = "3b. ETH Profile Levels", Order = 9)]
+		public bool EthValShow { get; set; }
+
+		[Display(Name = "ETH VAL: Label", Description = "Write the level name next to the line on ETH profiles.", GroupName = "3b. ETH Profile Levels", Order = 10)]
+		public bool EthValLabel { get; set; }
+
+		[Display(Name = "ETH VAL: Naked", Description = "Extend the ETH line to the right until price trades at it again.", GroupName = "3b. ETH Profile Levels", Order = 11)]
+		public bool EthValNaked { get; set; }
+
+		[Display(Name = "ETH VAL: Scale", Description = "Show a price tag for the newest ETH profile's level at the right edge, next to the price scale.", GroupName = "3b. ETH Profile Levels", Order = 12)]
+		public bool EthValScale { get; set; }
+
+		[Display(Name = "ETH Range High", Description = "Draw the session high line on ETH profiles shown with RTH profiles.", GroupName = "3b. ETH Profile Levels", Order = 13)]
+		public bool EthHighShow { get; set; }
+
+		[Display(Name = "ETH Range High: Label", Description = "Write the level name next to the line on ETH profiles.", GroupName = "3b. ETH Profile Levels", Order = 14)]
+		public bool EthHighLabel { get; set; }
+
+		[Display(Name = "ETH Range High: Naked", Description = "Extend the ETH line to the right until price trades at it again.", GroupName = "3b. ETH Profile Levels", Order = 15)]
+		public bool EthHighNaked { get; set; }
+
+		[Display(Name = "ETH Range High: Scale", Description = "Show a price tag for the newest ETH profile's level at the right edge, next to the price scale.", GroupName = "3b. ETH Profile Levels", Order = 16)]
+		public bool EthHighScale { get; set; }
+
+		[Display(Name = "ETH Range Low", Description = "Draw the session low line on ETH profiles shown with RTH profiles.", GroupName = "3b. ETH Profile Levels", Order = 17)]
+		public bool EthLowShow { get; set; }
+
+		[Display(Name = "ETH Range Low: Label", Description = "Write the level name next to the line on ETH profiles.", GroupName = "3b. ETH Profile Levels", Order = 18)]
+		public bool EthLowLabel { get; set; }
+
+		[Display(Name = "ETH Range Low: Naked", Description = "Extend the ETH line to the right until price trades at it again.", GroupName = "3b. ETH Profile Levels", Order = 19)]
+		public bool EthLowNaked { get; set; }
+
+		[Display(Name = "ETH Range Low: Scale", Description = "Show a price tag for the newest ETH profile's level at the right edge, next to the price scale.", GroupName = "3b. ETH Profile Levels", Order = 20)]
+		public bool EthLowScale { get; set; }
+
+		[Display(Name = "Extend ETH POC Into RTH", Description = "Extend the ETH session's point of control across the RTH session of the same day, labelled pETH POC. Off: only the newest day; Extend From Every Profile: every day.", GroupName = "3b. ETH Profile Levels", Order = 21)]
+		public bool EthPriorPocExtend { get; set; }
+
+		[Display(Name = "Extend ETH VAH Into RTH", Description = "Extend the ETH session's value area high across the RTH session of the same day, labelled pETH VAH. Off: only the newest day; Extend From Every Profile: every day.", GroupName = "3b. ETH Profile Levels", Order = 22)]
+		public bool EthPriorVahExtend { get; set; }
+
+		[Display(Name = "Extend ETH VAL Into RTH", Description = "Extend the ETH session's value area low across the RTH session of the same day, labelled pETH VAL. Off: only the newest day; Extend From Every Profile: every day.", GroupName = "3b. ETH Profile Levels", Order = 23)]
+		public bool EthPriorValExtend { get; set; }
+
+		[Display(Name = "Extend ETH High Into RTH", Description = "Extend the ETH session's range high across the RTH session of the same day, labelled pETH High. Off: only the newest day; Extend From Every Profile: every day.", GroupName = "3b. ETH Profile Levels", Order = 24)]
+		public bool EthPriorHighExtend { get; set; }
+
+		[Display(Name = "Extend ETH Low Into RTH", Description = "Extend the ETH session's range low across the RTH session of the same day, labelled pETH Low. Off: only the newest day; Extend From Every Profile: every day.", GroupName = "3b. ETH Profile Levels", Order = 25)]
+		public bool EthPriorLowExtend { get; set; }
+
+		[Display(Name = "Extend All Naked ETH POCs", Description = "Extend the point of control of every earlier ETH session that price has not traded at since to the right edge of the chart, labelled pETH nPOC.", GroupName = "3b. ETH Profile Levels", Order = 26)]
+		public bool EthNakedPocExtend { get; set; }
+
+		#endregion
+
 		#region Properties: 4. Profile - Structure Markers
 
 		[Display(Name = "Initial Balance Range (IBR)", Description = "Mark the initial balance of the current New York session: the high and low of the first minutes after the 09:30 New York open. The lines appear when those minutes are over, use the TPO Line Style, and end where the current profile's level lines end. The next New York open removes them. Earlier sessions are not marked.", GroupName = "4. Profile - Structure Markers", Order = 1)]
@@ -4844,7 +5316,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Poor Lows: Scale", Description = "Show a price tag for the latest profile's poor low at the right edge, next to the price scale.", GroupName = "4. Profile - Structure Markers", Order = 11)]
 		public bool PoorLowScale { get; set; }
 
-		[Display(Name = "Single Prints", Description = "Highlight rows inside the profile that only one block traded.", GroupName = "4. Profile - Structure Markers", Order = 12)]
+		[Display(Name = "Single Prints", Description = "Highlight rows inside the profile that only one block traded. Once price trades there again after the session they take the profile's own colour like the rest of it: RTH profiles count only New York session trading, ETH profiles count any trading.", GroupName = "4. Profile - Structure Markers", Order = 12)]
 		public bool ShowSinglePrints { get; set; }
 
 		[Display(Name = "Buying / Selling Tails", Description = "Highlight a single-width run at the low (buying tail) or at the high (selling tail).", GroupName = "4. Profile - Structure Markers", Order = 13)]
@@ -4890,10 +5362,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Developing VA", Description = "Draw how the value area high and low moved through the session, block by block.", GroupName = "5. Profile - Annotations", Order = 7)]
 		public bool DevelopingVa { get; set; }
 
-		[Display(Name = "Day Type", Description = "Label each profile above its high with its day type: Normal, Normal variation, Trend, Double distribution trend, Neutral (center), Neutral (extreme) or Non-trend.", GroupName = "5. Profile - Annotations", Order = 8)]
+		[Display(Name = "Day Type", Description = "Label each RTH profile above its high with its day type: Normal, Normal variation, Trend, Double distribution trend, Neutral (center), Neutral (extreme) or Non-trend. ETH profiles get no day type.", GroupName = "5. Profile - Annotations", Order = 8)]
 		public bool DayType { get; set; }
 
-		[Display(Name = "Open Type", Description = "Label each profile above its high with its open type, read from the first 30 minutes: Open-Drive, Open-Test-Drive, Open-Rejection-Reverse or Open-Auction (in range / out of range).", GroupName = "5. Profile - Annotations", Order = 9)]
+		[Display(Name = "Open Type", Description = "Label each RTH profile above its high with its open type, read from the first 30 minutes: Open-Drive, Open-Test-Drive, Open-Rejection-Reverse or Open-Auction (in range / out of range). ETH profiles get no open type.", GroupName = "5. Profile - Annotations", Order = 9)]
 		public bool OpenType { get; set; }
 
 		#endregion
@@ -4962,7 +5434,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		public bool EnableClickMerge { get; set; }
 
 		[Range(0, 1000)]
-		[Display(Name = "Merge Latest With Prior", Description = "Always merge the current session with this many prior sessions. 0 turns it off.", GroupName = "7. Merge and Expand", Order = 2)]
+		[Display(Name = "Merge Latest With Prior", Description = "Always merge the current RTH session with this many prior RTH sessions. 0 turns it off. ETH profiles are never merged.", GroupName = "7. Merge and Expand", Order = 2)]
 		public int MergeLatestCount { get; set; }
 
 		[Display(Name = "Merged Sessions", Description = "Sessions merged into the session before them, separated by semicolons. D20261002 is the day 2 Oct 2026, W and M prefixes are weeks (Monday date) and months. Filled in by the profile menu; clear it to undo every merge.", GroupName = "7. Merge and Expand", Order = 3)]
@@ -5075,7 +5547,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Outside VA", Description = "Colour of rows outside the value area when Outside VA Colors is on.", GroupName = "8. Colors", Order = 10)]
+		[Display(Name = "Outside VA", Description = "Colour of RTH profile rows outside the value area when Outside VA Colors is on.", GroupName = "8. Colors", Order = 10)]
 		public Brush OutsideValueAreaBrush { get; set; }
 
 		[Browsable(false)]
@@ -5086,7 +5558,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "POC Row", Description = "Colour of the blocks in the point of control row.", GroupName = "8. Colors", Order = 11)]
+		[Display(Name = "Outside VA (ETH)", Description = "Colour of ETH profile rows outside the value area when Outside VA Colors is on.", GroupName = "8. Colors", Order = 11)]
+		public Brush EthOutsideValueAreaBrush { get; set; }
+
+		[Browsable(false)]
+		public string EthOutsideValueAreaBrushSerialize
+		{
+			get { return Serialize.BrushToString(EthOutsideValueAreaBrush); }
+			set { EthOutsideValueAreaBrush = Serialize.StringToBrush(value); }
+		}
+
+		[XmlIgnore]
+		[Display(Name = "POC Row", Description = "Colour of the blocks in the point of control row.", GroupName = "8. Colors", Order = 12)]
 		public Brush PocRowBrush { get; set; }
 
 		[Browsable(false)]
@@ -5097,7 +5580,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Letters", Description = "Colour of the block letters.", GroupName = "8. Colors", Order = 12)]
+		[Display(Name = "Letters", Description = "Colour of the block letters.", GroupName = "8. Colors", Order = 13)]
 		public Brush LetterBrush { get; set; }
 
 		[Browsable(false)]
@@ -5108,7 +5591,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Start Block", Description = "Highlight Start/End: colour of the block where the session opened.", GroupName = "8. Colors", Order = 13)]
+		[Display(Name = "Start Block", Description = "Highlight Start/End: colour of the block where the session opened.", GroupName = "8. Colors", Order = 14)]
 		public Brush OpenBlockBrush { get; set; }
 
 		[Browsable(false)]
@@ -5119,7 +5602,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "End Block", Description = "Highlight Start/End: colour of the block where the session last traded.", GroupName = "8. Colors", Order = 14)]
+		[Display(Name = "End Block", Description = "Highlight Start/End: colour of the block where the session last traded.", GroupName = "8. Colors", Order = 15)]
 		public Brush CloseBlockBrush { get; set; }
 
 		[Browsable(false)]
@@ -5130,7 +5613,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Point of Control (POC)", Description = "Colour of the point of control line, label and tag.", GroupName = "8. Colors", Order = 15)]
+		[Display(Name = "Point of Control (POC)", Description = "Colour of the point of control line, label and tag.", GroupName = "8. Colors", Order = 16)]
 		public Brush PocLineBrush { get; set; }
 
 		[Browsable(false)]
@@ -5141,7 +5624,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Value Area High (VAH)", Description = "Colour of the value area high line, label and tag.", GroupName = "8. Colors", Order = 16)]
+		[Display(Name = "Value Area High (VAH)", Description = "Colour of the value area high line, label and tag.", GroupName = "8. Colors", Order = 17)]
 		public Brush VahBrush { get; set; }
 
 		[Browsable(false)]
@@ -5152,7 +5635,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Value Area Low (VAL)", Description = "Colour of the value area low line, label and tag.", GroupName = "8. Colors", Order = 17)]
+		[Display(Name = "Value Area Low (VAL)", Description = "Colour of the value area low line, label and tag.", GroupName = "8. Colors", Order = 18)]
 		public Brush ValBrush { get; set; }
 
 		[Browsable(false)]
@@ -5163,7 +5646,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Prior High", Description = "Colour of the extended prior range high line and label.", GroupName = "8. Colors", Order = 18)]
+		[Display(Name = "Range High", Description = "Colour of the range high line and label, on the profile and where it is extended.", GroupName = "8. Colors", Order = 19)]
 		public Brush PriorHighBrush { get; set; }
 
 		[Browsable(false)]
@@ -5174,7 +5657,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Prior Low", Description = "Colour of the extended prior range low line and label.", GroupName = "8. Colors", Order = 19)]
+		[Display(Name = "Range Low", Description = "Colour of the range low line and label, on the profile and where it is extended.", GroupName = "8. Colors", Order = 20)]
 		public Brush PriorLowBrush { get; set; }
 
 		[Browsable(false)]
@@ -5185,7 +5668,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Gap Line", Description = "Colour of the opening gap line and its GAP label.", GroupName = "8. Colors", Order = 20)]
+		[Display(Name = "Gap Line", Description = "Colour of the opening gap line and its GAP label.", GroupName = "8. Colors", Order = 21)]
 		public Brush GapLineBrush { get; set; }
 
 		[Browsable(false)]
@@ -5196,7 +5679,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Gap Area", Description = "Colour of the highlighted band over an unfilled gap. Its strength is set by Gap Area Opacity %.", GroupName = "8. Colors", Order = 21)]
+		[Display(Name = "Gap Area", Description = "Colour of the highlighted band over an unfilled gap. Its strength is set by Gap Area Opacity %.", GroupName = "8. Colors", Order = 22)]
 		public Brush GapAreaBrush { get; set; }
 
 		[Browsable(false)]
@@ -5207,7 +5690,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Value Area Fill", Description = "Colour of the value area shading.", GroupName = "8. Colors", Order = 22)]
+		[Display(Name = "Value Area Fill", Description = "Colour of the value area shading.", GroupName = "8. Colors", Order = 23)]
 		public Brush ValueAreaFillBrush { get; set; }
 
 		[Browsable(false)]
@@ -5218,7 +5701,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Initial Balance Range (IBR)", Description = "Colour of the initial balance high and low lines.", GroupName = "8. Colors", Order = 23)]
+		[Display(Name = "Initial Balance Range (IBR)", Description = "Colour of the initial balance high and low lines.", GroupName = "8. Colors", Order = 24)]
 		public Brush InitialBalanceBrush { get; set; }
 
 		[Browsable(false)]
@@ -5229,7 +5712,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Range Extension", Description = "Colour of the range extension marks.", GroupName = "8. Colors", Order = 24)]
+		[Display(Name = "Range Extension", Description = "Colour of the range extension marks.", GroupName = "8. Colors", Order = 25)]
 		public Brush RangeExtensionBrush { get; set; }
 
 		[Browsable(false)]
@@ -5240,7 +5723,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Poor Highs", Description = "Colour of the poor high marker.", GroupName = "8. Colors", Order = 25)]
+		[Display(Name = "Poor Highs", Description = "Colour of the poor high marker.", GroupName = "8. Colors", Order = 26)]
 		public Brush PoorHighBrush { get; set; }
 
 		[Browsable(false)]
@@ -5251,7 +5734,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Poor Lows", Description = "Colour of the poor low marker.", GroupName = "8. Colors", Order = 26)]
+		[Display(Name = "Poor Lows", Description = "Colour of the poor low marker.", GroupName = "8. Colors", Order = 27)]
 		public Brush PoorLowBrush { get; set; }
 
 		[Browsable(false)]
@@ -5262,7 +5745,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Single Prints", Description = "Colour of single print rows.", GroupName = "8. Colors", Order = 27)]
+		[Display(Name = "Single Prints", Description = "Colour of single print rows.", GroupName = "8. Colors", Order = 28)]
 		public Brush SinglePrintBrush { get; set; }
 
 		[Browsable(false)]
@@ -5273,7 +5756,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Buying Tail", Description = "Colour of buying tail rows.", GroupName = "8. Colors", Order = 28)]
+		[Display(Name = "Buying Tail", Description = "Colour of buying tail rows.", GroupName = "8. Colors", Order = 29)]
 		public Brush BuyingTailBrush { get; set; }
 
 		[Browsable(false)]
@@ -5284,7 +5767,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Selling Tail", Description = "Colour of selling tail rows.", GroupName = "8. Colors", Order = 29)]
+		[Display(Name = "Selling Tail", Description = "Colour of selling tail rows.", GroupName = "8. Colors", Order = 30)]
 		public Brush SellingTailBrush { get; set; }
 
 		[Browsable(false)]
@@ -5295,7 +5778,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Developing POC", Description = "Colour of the developing point of control line.", GroupName = "8. Colors", Order = 30)]
+		[Display(Name = "Developing POC", Description = "Colour of the developing point of control line.", GroupName = "8. Colors", Order = 31)]
 		public Brush DevelopingPocBrush { get; set; }
 
 		[Browsable(false)]
@@ -5306,7 +5789,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Developing VA", Description = "Colour of the developing value area lines.", GroupName = "8. Colors", Order = 31)]
+		[Display(Name = "Developing VA", Description = "Colour of the developing value area lines.", GroupName = "8. Colors", Order = 32)]
 		public Brush DevelopingVaBrush { get; set; }
 
 		[Browsable(false)]
@@ -5317,7 +5800,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "One-Time Framing Up", Description = "Colour of the one-time-framing ribbon while framing up.", GroupName = "8. Colors", Order = 32)]
+		[Display(Name = "One-Time Framing Up", Description = "Colour of the one-time-framing ribbon while framing up.", GroupName = "8. Colors", Order = 33)]
 		public Brush OtfUpBrush { get; set; }
 
 		[Browsable(false)]
@@ -5328,7 +5811,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "One-Time Framing Down", Description = "Colour of the one-time-framing ribbon while framing down.", GroupName = "8. Colors", Order = 33)]
+		[Display(Name = "One-Time Framing Down", Description = "Colour of the one-time-framing ribbon while framing down.", GroupName = "8. Colors", Order = 34)]
 		public Brush OtfDownBrush { get; set; }
 
 		[Browsable(false)]
@@ -5339,7 +5822,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Volume: Inside Value Area", Description = "Colour of volume bars inside the volume value area, and the high end of the colour grade.", GroupName = "8. Colors", Order = 34)]
+		[Display(Name = "Volume: Inside Value Area", Description = "Colour of volume bars inside the volume value area, and the high end of the colour grade.", GroupName = "8. Colors", Order = 35)]
 		public Brush VolumeBrush { get; set; }
 
 		[Browsable(false)]
@@ -5350,7 +5833,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Volume: Outside Value Area", Description = "Colour of volume bars outside the volume value area, and the low end of the colour grade.", GroupName = "8. Colors", Order = 35)]
+		[Display(Name = "Volume: Outside Value Area", Description = "Colour of volume bars outside the volume value area, and the low end of the colour grade.", GroupName = "8. Colors", Order = 36)]
 		public Brush VolumeOutsideBrush { get; set; }
 
 		[Browsable(false)]
@@ -5361,7 +5844,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Volume: Point of Control", Description = "Colour of the volume point of control line, label and tag.", GroupName = "8. Colors", Order = 36)]
+		[Display(Name = "Volume: Point of Control", Description = "Colour of the volume point of control line, label and tag.", GroupName = "8. Colors", Order = 37)]
 		public Brush VolumePocBrush { get; set; }
 
 		[Browsable(false)]
@@ -5372,7 +5855,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Volume: Value Area High", Description = "Colour of the volume value area high line, label and tag.", GroupName = "8. Colors", Order = 37)]
+		[Display(Name = "Volume: Value Area High", Description = "Colour of the volume value area high line, label and tag.", GroupName = "8. Colors", Order = 38)]
 		public Brush VolumeVahBrush { get; set; }
 
 		[Browsable(false)]
@@ -5383,7 +5866,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Volume: Value Area Low", Description = "Colour of the volume value area low line, label and tag.", GroupName = "8. Colors", Order = 38)]
+		[Display(Name = "Volume: Value Area Low", Description = "Colour of the volume value area low line, label and tag.", GroupName = "8. Colors", Order = 39)]
 		public Brush VolumeValBrush { get; set; }
 
 		[Browsable(false)]
@@ -5394,7 +5877,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Text", Description = "Colour of annotations, row counts and volume numbers.", GroupName = "8. Colors", Order = 39)]
+		[Display(Name = "Text", Description = "Colour of annotations, row counts and volume numbers.", GroupName = "8. Colors", Order = 40)]
 		public Brush TextBrush { get; set; }
 
 		[Browsable(false)]
@@ -5405,7 +5888,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Day Type Label", Description = "Colour of the day type label above the profile.", GroupName = "8. Colors", Order = 40)]
+		[Display(Name = "Day Type Label", Description = "Colour of the day type label above the profile.", GroupName = "8. Colors", Order = 41)]
 		public Brush DayTypeBrush { get; set; }
 
 		[Browsable(false)]
@@ -5416,7 +5899,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Open Type Label", Description = "Colour of the open type label above the profile.", GroupName = "8. Colors", Order = 41)]
+		[Display(Name = "Open Type Label", Description = "Colour of the open type label above the profile.", GroupName = "8. Colors", Order = 42)]
 		public Brush OpenTypeBrush { get; set; }
 
 		[Browsable(false)]
@@ -5427,7 +5910,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[XmlIgnore]
-		[Display(Name = "Statistics Box Background", Description = "Background colour of the statistics box.", GroupName = "8. Colors", Order = 42)]
+		[Display(Name = "Statistics Box Background", Description = "Background colour of the statistics box.", GroupName = "8. Colors", Order = 43)]
 		public Brush StatisticsBackgroundBrush { get; set; }
 
 		[Browsable(false)]
