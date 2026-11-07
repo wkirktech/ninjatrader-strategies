@@ -115,6 +115,8 @@ Writes every closed bar of the chart's series to `Documents\NinjaTrader 8\analys
 
 Register them in Windows Task Scheduler with `tools/register-agent-tasks.ps1` (`-Remove` to delete). They run only while you are logged on, with read-only tools: no job can write, edit or run code. The script passes files in and appends the review's lesson itself.
 
+The same script also schedules `tools/context_sheet.py` (plain Python, no agent) at 6:25 and 7:31 PT on weekdays. It reads BarLogger's NQ 1-minute export and writes `briefs\<date>-context.md`: prior-day and overnight levels, the initial balance, and the market profile hit rates that held up on 2021-2026 data, with a long/short/no lean. Context only: as stand-alone entries these stats did not beat costs. Needs NinjaTrader open with BarLogger on the 1-min NQ chart; `--at "YYYY-MM-DD HH:MM"` replays a past morning.
+
 ## Development workflow
 
 - `main`: stable, tested releases (tagged, e.g. `v1.0.0`).
