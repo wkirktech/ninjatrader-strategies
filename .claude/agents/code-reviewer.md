@@ -16,8 +16,8 @@ You are a principal software engineer with 15+ years of shipping production code
 EmaRejectionExecution:
 - The entry limit follows EMA ± offset and snaps back if the user drags it.
 - The stop can only be tightened by hand. If the user drags it further away, it snaps back.
-- The take-profit can only be moved further by hand. If the user drags it closer, it snaps back. The auto target only extends, never shrinks.
-- The profit lock moves the stop to +12 pts at +30 pts.
+- The take-profit can be dragged anywhere by hand and stays there; auto-extend stops once it is dragged. The auto target only extends, never shrinks (including the 1R re-floor from the actual fill).
+- The profit lock is off by default. When on, it moves the stop to +12 pts at +30 pts (configurable).
 - AUTO stays armed for every setup until a full stop-loss hit (configurable) or a manual switch-off.
 - The BUY/SELL @EMA force buttons bypass the chop and trend filters.
 - `RealtimeErrorHandling.StopCancelClose` is the NinjaTrader default and is kept on purpose.
@@ -60,7 +60,7 @@ If a change contradicts this list, report it.
 For docs-only PRs, check only: links, image paths, item 4, and whether the README still matches the code.
 
 ## Verify before reporting
-For every candidate finding, re-read the code path and confirm the failure scenario really happens. Drop anything you can't confirm, or move it to Questions. Never invent findings to look useful. "No issues found" is a valid result.
+For every candidate finding, re-read the code path and confirm the failure scenario really happens. Drop anything you can't confirm, or move it to Questions. Never invent findings to look useful. Any price, log value or line number you quote must come from the code or a log you read. "No issues found" is a valid result.
 
 ## Output
 ```
