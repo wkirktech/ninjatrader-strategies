@@ -56,7 +56,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private int newAnchorBar = -1;     // set by the tick series, picked up when that chart bar closes
 		private int anchorBar = -1;
 		private double anchorHigh, anchorLow;
-		private int lastColor;             // 1 green, -1 red, 0 none yet since the anchor
 
 		// Auto size: the AutoRank-th largest group of 09:30-10:00 ET sets the minimum for the rest of the day
 		private TimeZoneInfo eastern;
@@ -96,10 +95,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ShowLabels = true;
 				AlertSize = 0;
 				SoundOnBubble = true;
-				SoundOnFirstColor = true;
-				SoundOnFlip = true;
-				UpBarSound = "Alert1.wav";
-				DownBarSound = "Alert3.wav";
 				BuySound = "Alert2.wav";
 				SellSound = "Alert4.wav";
 				ColorBars = true;
@@ -230,7 +225,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				anchorHigh = High[ago];
 				anchorLow = Low[ago];
 				newAnchorBar = -1;
-				lastColor = 0;
 			}
 			int n = CurrentBar - anchorBar;
 			if (anchorBar < 0 || n < 1 || n > ColorBarsCount)
@@ -243,11 +237,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (c == 0)
 				return;
 			BarBrush = c > 0 ? UpBarBrush : DownBarBrush;
-
-			// Structure turned (first color after the bubble, or green <-> red): sound, live only
-			if (c != lastColor && State == State.Realtime && (lastColor != 0 ? SoundOnFlip : SoundOnFirstColor))
-				PlaySound(NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + (c > 0 ? UpBarSound : DownBarSound));
-			lastColor = c;
 		}
 
 		// Minimum size for a bubble at this US Eastern time
@@ -486,18 +475,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Display(Name = "Sell sound", Description = "File in NinjaTrader's sounds folder, e.g. Alert4.wav.", Order = 21, GroupName = "Alerts and log")]
 		public string SellSound { get; set; }
-
-		[Display(Name = "Sound on first colored bar", Description = "Live only: the first green/red bar after a bubble (the setup trigger).", Order = 22, GroupName = "Bar colors")]
-		public bool SoundOnFirstColor { get; set; }
-
-		[Display(Name = "Sound when color flips", Description = "Live only: colored bars switch green <-> red inside the window (structure change / fake-out).", Order = 23, GroupName = "Bar colors")]
-		public bool SoundOnFlip { get; set; }
-
-		[Display(Name = "Green bar sound", Description = "File in NinjaTrader's sounds folder.", Order = 24, GroupName = "Bar colors")]
-		public string UpBarSound { get; set; }
-
-		[Display(Name = "Red bar sound", Description = "File in NinjaTrader's sounds folder.", Order = 25, GroupName = "Bar colors")]
-		public string DownBarSound { get; set; }
 
 		[Display(Name = "Log live bubbles", Description = "Appends each live bubble and its outcome to one CSV per day, for forward testing.", Order = 13, GroupName = "Alerts and log")]
 		public bool LogBubbles { get; set; }
