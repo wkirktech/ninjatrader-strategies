@@ -24,6 +24,7 @@ using NinjaTrader.NinjaScript;
 // Works on any chart: trades come from a 1-tick series (bid/ask per trade), in history and live.
 // Research (2026-11-07, 44 NQ sessions): no mechanical edge from the bubbles alone; this is a discretionary aid.
 public enum BigTradesSizeMode { Fixed, Auto }
+public enum BigTradesColorRule { CloseBeyondRange, HighLow }
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
@@ -102,6 +103,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				BuySound = "Alert2.wav";
 				SellSound = "Alert4.wav";
 				ColorBars = true;
+				ColorRule = BigTradesColorRule.CloseBeyondRange;
 				ColorBarsCount = 20;
 				UpBarBrush = Brushes.LimeGreen;
 				DownBarBrush = Brushes.Red;
@@ -212,8 +214,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
-		// Chart bar closed: the next ColorBarsCount bars after the latest bubble's bar are painted green when both their high
-		// and low are above that bar's (higher high, higher low), red when both are below, and left alone when mixed.
+		// Chart bar closed: the next ColorBarsCount bars after the latest bubble's bar are painted against that bar's range.
+		//   CloseBeyondRange (default): green when the bar closes above its high, red when it closes below its low
+		//                               (a structure break; a wick into the range in chop does not count).
+		//   HighLow: green when high AND low are both above its high and low, red when both are below.
+		// Anything else is left alone.
 		private void ColorBar()
 		{
 			if (!ColorBars)
@@ -230,7 +235,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			int n = CurrentBar - anchorBar;
 			if (anchorBar < 0 || n < 1 || n > ColorBarsCount)
 				return;
-			int c = High[0] > anchorHigh && Low[0] > anchorLow ? 1 : High[0] < anchorHigh && Low[0] < anchorLow ? -1 : 0;
+			int c;
+			if (ColorRule == BigTradesColorRule.CloseBeyondRange)
+				c = Close[0] > anchorHigh ? 1 : Close[0] < anchorLow ? -1 : 0;
+			else
+				c = High[0] > anchorHigh && Low[0] > anchorLow ? 1 : High[0] < anchorHigh && Low[0] < anchorLow ? -1 : 0;
 			if (c == 0)
 				return;
 			BarBrush = c > 0 ? UpBarBrush : DownBarBrush;
@@ -496,12 +505,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Log folder", Order = 14, GroupName = "Alerts and log")]
 		public string LogFolder { get; set; }
 
-		[Display(Name = "Color bars after bubble", Description = "Paint the next bars green when high and low are both above the bubble's bar, red when both below.", Order = 15, GroupName = "Bar colors")]
+		[Display(Name = "Color bars after bubble", Description = "Paint the next bars green / red when they break the bubble bar's range up / down (see Color rule).", Order = 15, GroupName = "Bar colors")]
 		public bool ColorBars { get; set; }
 
 		[Range(1, 500)]
 		[Display(Name = "Bars to color", Order = 16, GroupName = "Bar colors")]
 		public int ColorBarsCount { get; set; }
+
+		[Display(Name = "Color rule", Description = "CloseBeyondRange: the bar must CLOSE above the bubble bar's high (green) or below its low (red); wicks in chop don't flip it. HighLow: the older, looser rule (high and low both beyond).", Order = 16, GroupName = "Bar colors")]
+		public BigTradesColorRule ColorRule { get; set; }
 
 		[XmlIgnore]
 		[Display(Name = "Higher high / higher low color", Order = 17, GroupName = "Bar colors")]
