@@ -395,10 +395,23 @@ namespace NinjaTrader.NinjaScript.Indicators
 					RenderTarget.FillEllipse(ellipse, brush);
 					brush.Opacity = 1f;
 				}
-				if (ShowLabels && r >= 9)
-					RenderTarget.DrawText(bb.Size.ToString(CultureInfo.InvariantCulture), textFormat, new SharpDX.RectangleF(x - 30, y - r, 60, 2 * r), dxText);
+				if (ShowLabels)
+					DrawLabel(bb.Size.ToString(CultureInfo.InvariantCulture), x, y, r, brush);
 			}
 			RenderTarget.AntialiasMode = oldAa;
+		}
+
+		// Contract count inside the bubble when it fits, otherwise just right of it in the bubble's color
+		private void DrawLabel(string text, float x, float y, float r, SharpDX.Direct2D1.Brush bubbleBrush)
+		{
+			float width;
+			using (var layout = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, text, textFormat, 200, 20))
+				width = layout.Metrics.Width;
+			const float pad = 2f;
+			if (width + 2 * pad <= 2 * r)
+				RenderTarget.DrawText(text, textFormat, new SharpDX.RectangleF(x - r, y - r, 2 * r, 2 * r), dxText);
+			else
+				RenderTarget.DrawText(text, textFormat, new SharpDX.RectangleF(x + r + pad, y - 10, width + 2 * pad, 20), bubbleBrush);
 		}
 		#endregion
 
@@ -435,7 +448,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Bubble scale", Order = 8, GroupName = "Display")]
 		public double BubbleScale { get; set; }
 
-		[Display(Name = "Show size labels", Order = 9, GroupName = "Display")]
+		[Display(Name = "Show size labels", Description = "Contract count on every bubble: inside when it fits, otherwise next to it.", Order = 9, GroupName = "Display")]
 		public bool ShowLabels { get; set; }
 
 		[XmlIgnore]
