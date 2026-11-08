@@ -93,6 +93,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				BubbleScale = 1.0;
 				ShowLabels = true;
 				AlertSize = 0;
+				SoundOnBubble = true;
+				BuySound = "Alert2.wav";
+				SellSound = "Alert4.wav";
 				ColorBars = true;
 				ColorBarsCount = 20;
 				UpBarBrush = Brushes.LimeGreen;
@@ -191,9 +194,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 				pending.Add(bb);
 				if (ColorBars)
 					newAnchorBar = BarsArray[0].GetBar(bb.Time);   // the chart bar that holds the bubble
-				if (State == State.Realtime && AlertSize > 0 && size >= AlertSize)
-					Alert("BigTrades" + grpLast[g].Ticks, Priority.Medium, (bb.Side > 0 ? "Big BUY " : "Big SELL ") + size + " @ " + Instrument.MasterInstrument.FormatPrice(bb.Price),
-						NinjaTrader.Core.Globals.InstallDir + @"\sounds\Alert2.wav", 5, bb.Side > 0 ? Brushes.DarkGreen : Brushes.DarkRed, Brushes.White);
+				if (State == State.Realtime)
+				{
+					// Every bubble: a short sound (buy and sell can differ). Bigger ones: an Alerts window entry instead.
+					string sound = NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + (bb.Side > 0 ? BuySound : SellSound);
+					if (AlertSize > 0 && size >= AlertSize)
+						Alert("BigTrades" + grpLast[g].Ticks, Priority.Medium, (bb.Side > 0 ? "Big BUY " : "Big SELL ") + size + " @ " + Instrument.MasterInstrument.FormatPrice(bb.Price),
+							sound, 5, bb.Side > 0 ? Brushes.DarkGreen : Brushes.DarkRed, Brushes.White);
+					else if (SoundOnBubble)
+						PlaySound(sound);
+				}
 			}
 		}
 
@@ -435,6 +445,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Alert size (0 = off)", Description = "Live only: sound and Alerts window entry for groups at least this big.", Order = 12, GroupName = "Alerts and log")]
 		public int AlertSize { get; set; }
 
+		[Display(Name = "Sound on every bubble", Description = "Live only: plays the buy or sell sound when a bubble forms.", Order = 19, GroupName = "Alerts and log")]
+		public bool SoundOnBubble { get; set; }
+
+		[Display(Name = "Buy sound", Description = "File in NinjaTrader's sounds folder, e.g. Alert2.wav.", Order = 20, GroupName = "Alerts and log")]
+		public string BuySound { get; set; }
+
+		[Display(Name = "Sell sound", Description = "File in NinjaTrader's sounds folder, e.g. Alert4.wav.", Order = 21, GroupName = "Alerts and log")]
+		public string SellSound { get; set; }
+
 		[Display(Name = "Log live bubbles", Description = "Appends each live bubble and its outcome to one CSV per day, for forward testing.", Order = 13, GroupName = "Alerts and log")]
 		public bool LogBubbles { get; set; }
 
@@ -465,3 +484,59 @@ namespace NinjaTrader.NinjaScript.Indicators
 	}
 }
 
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private BigTrades[] cacheBigTrades;
+		public BigTrades BigTrades(int minSize)
+		{
+			return BigTrades(Input, minSize);
+		}
+
+		public BigTrades BigTrades(ISeries<double> input, int minSize)
+		{
+			if (cacheBigTrades != null)
+				for (int idx = 0; idx < cacheBigTrades.Length; idx++)
+					if (cacheBigTrades[idx] != null && cacheBigTrades[idx].MinSize == minSize && cacheBigTrades[idx].EqualsInput(input))
+						return cacheBigTrades[idx];
+			return CacheIndicator<BigTrades>(new BigTrades(){ MinSize = minSize }, input, ref cacheBigTrades);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.BigTrades BigTrades(int minSize)
+		{
+			return indicator.BigTrades(Input, minSize);
+		}
+
+		public Indicators.BigTrades BigTrades(ISeries<double> input , int minSize)
+		{
+			return indicator.BigTrades(input, minSize);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.BigTrades BigTrades(int minSize)
+		{
+			return indicator.BigTrades(Input, minSize);
+		}
+
+		public Indicators.BigTrades BigTrades(ISeries<double> input , int minSize)
+		{
+			return indicator.BigTrades(input, minSize);
+		}
+	}
+}
+
+#endregion
