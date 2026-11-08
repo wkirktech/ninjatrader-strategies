@@ -51,6 +51,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private double lastPrice;
 		private int lastSide = 1;
 
+		// Bar coloring: the chart bar holding the latest bubble is the anchor for the next ColorBarsCount bars
+		private int newAnchorBar = -1;     // set by the tick series, picked up when that chart bar closes
+		private int anchorBar = -1;
+		private double anchorHigh, anchorLow;
+
 		// Auto size: the AutoRank-th largest group of 09:30-10:00 ET sets the minimum for the rest of the day
 		private TimeZoneInfo eastern;
 		private DateTime autoDay = DateTime.MinValue;
@@ -88,6 +93,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				BubbleScale = 1.0;
 				ShowLabels = true;
 				AlertSize = 0;
+				ColorBars = true;
+				ColorBarsCount = 20;
+				UpBarBrush = Brushes.LimeGreen;
+				DownBarBrush = Brushes.Red;
 				LogBubbles = false;
 				LogFolder = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", "bubbles");
 				BuyBrush = Brushes.LimeGreen;
@@ -120,6 +129,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		protected override void OnBarUpdate()
 		{
+			if (BarsInProgress == 0)
+			{
+				ColorBar();
+				return;
+			}
 			if (BarsInProgress != 1)
 				return;
 			int b = CurrentBars[1];
@@ -175,10 +189,35 @@ namespace NinjaTrader.NinjaScript.Indicators
 				lock (bubbleLock)
 					bubbles.Add(bb);
 				pending.Add(bb);
+				if (ColorBars)
+					newAnchorBar = BarsArray[0].GetBar(bb.Time);   // the chart bar that holds the bubble
 				if (State == State.Realtime && AlertSize > 0 && size >= AlertSize)
 					Alert("BigTrades" + grpLast[g].Ticks, Priority.Medium, (bb.Side > 0 ? "Big BUY " : "Big SELL ") + size + " @ " + Instrument.MasterInstrument.FormatPrice(bb.Price),
 						NinjaTrader.Core.Globals.InstallDir + @"\sounds\Alert2.wav", 5, bb.Side > 0 ? Brushes.DarkGreen : Brushes.DarkRed, Brushes.White);
 			}
+		}
+
+		// Chart bar closed: the next ColorBarsCount bars after the latest bubble's bar are painted green when both their high
+		// and low are above that bar's (higher high, higher low), red when both are below, and left alone when mixed.
+		private void ColorBar()
+		{
+			if (!ColorBars)
+				return;
+			if (newAnchorBar >= 0 && newAnchorBar <= CurrentBar)
+			{
+				int ago = CurrentBar - newAnchorBar;
+				anchorBar = newAnchorBar;
+				anchorHigh = High[ago];
+				anchorLow = Low[ago];
+				newAnchorBar = -1;
+			}
+			int n = CurrentBar - anchorBar;
+			if (anchorBar < 0 || n < 1 || n > ColorBarsCount)
+				return;
+			if (High[0] > anchorHigh && Low[0] > anchorLow)
+				BarBrush = UpBarBrush;
+			else if (High[0] < anchorHigh && Low[0] < anchorLow)
+				BarBrush = DownBarBrush;
 		}
 
 		// Minimum size for a bubble at this US Eastern time
@@ -401,120 +440,28 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Display(Name = "Log folder", Order = 14, GroupName = "Alerts and log")]
 		public string LogFolder { get; set; }
+
+		[Display(Name = "Color bars after bubble", Description = "Paint the next bars green when high and low are both above the bubble's bar, red when both below.", Order = 15, GroupName = "Bar colors")]
+		public bool ColorBars { get; set; }
+
+		[Range(1, 500)]
+		[Display(Name = "Bars to color", Order = 16, GroupName = "Bar colors")]
+		public int ColorBarsCount { get; set; }
+
+		[XmlIgnore]
+		[Display(Name = "Higher high / higher low color", Order = 17, GroupName = "Bar colors")]
+		public Brush UpBarBrush { get; set; }
+
+		[Browsable(false)]
+		public string UpBarBrushSerializable { get { return Serialize.BrushToString(UpBarBrush); } set { UpBarBrush = Serialize.StringToBrush(value); } }
+
+		[XmlIgnore]
+		[Display(Name = "Lower low / lower high color", Order = 18, GroupName = "Bar colors")]
+		public Brush DownBarBrush { get; set; }
+
+		[Browsable(false)]
+		public string DownBarBrushSerializable { get { return Serialize.BrushToString(DownBarBrush); } set { DownBarBrush = Serialize.StringToBrush(value); } }
 		#endregion
 	}
 }
 
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private BigTrades[] cacheBigTrades;
-		public BigTrades BigTrades(int minSize)
-		{
-			return BigTrades(Input, minSize);
-		}
-
-		public BigTrades BigTrades(ISeries<double> input, int minSize)
-		{
-			if (cacheBigTrades != null)
-				for (int idx = 0; idx < cacheBigTrades.Length; idx++)
-					if (cacheBigTrades[idx] != null && cacheBigTrades[idx].MinSize == minSize && cacheBigTrades[idx].EqualsInput(input))
-						return cacheBigTrades[idx];
-			return CacheIndicator<BigTrades>(new BigTrades(){ MinSize = minSize }, input, ref cacheBigTrades);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.BigTrades BigTrades(int minSize)
-		{
-			return indicator.BigTrades(Input, minSize);
-		}
-
-		public Indicators.BigTrades BigTrades(ISeries<double> input , int minSize)
-		{
-			return indicator.BigTrades(input, minSize);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.BigTrades BigTrades(int minSize)
-		{
-			return indicator.BigTrades(Input, minSize);
-		}
-
-		public Indicators.BigTrades BigTrades(ISeries<double> input , int minSize)
-		{
-			return indicator.BigTrades(input, minSize);
-		}
-	}
-}
-
-#endregion
-
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private BigTrades[] cacheBigTrades;
-		public BigTrades BigTrades(int minSize)
-		{
-			return BigTrades(Input, minSize);
-		}
-
-		public BigTrades BigTrades(ISeries<double> input, int minSize)
-		{
-			if (cacheBigTrades != null)
-				for (int idx = 0; idx < cacheBigTrades.Length; idx++)
-					if (cacheBigTrades[idx] != null && cacheBigTrades[idx].MinSize == minSize && cacheBigTrades[idx].EqualsInput(input))
-						return cacheBigTrades[idx];
-			return CacheIndicator<BigTrades>(new BigTrades(){ MinSize = minSize }, input, ref cacheBigTrades);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.BigTrades BigTrades(int minSize)
-		{
-			return indicator.BigTrades(Input, minSize);
-		}
-
-		public Indicators.BigTrades BigTrades(ISeries<double> input , int minSize)
-		{
-			return indicator.BigTrades(input, minSize);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.BigTrades BigTrades(int minSize)
-		{
-			return indicator.BigTrades(Input, minSize);
-		}
-
-		public Indicators.BigTrades BigTrades(ISeries<double> input , int minSize)
-		{
-			return indicator.BigTrades(input, minSize);
-		}
-	}
-}
-
-#endregion
