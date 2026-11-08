@@ -1,4 +1,4 @@
-﻿#region Using declarations
+#region Using declarations
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -141,6 +141,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				DeltaSwingBars = 20;
 				DivToleranceTicks = 2;
 				ShowMarkers = true;
+				SoundOnCircles = true;
+				SoundOnArrows = true;
+				LongSound = "Announcement.wav";
+				ShortSound = "Reversing.wav";
 				LogBars = false;
 				LogFolder = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "analysis", "bars");
 				UpBrush = Brushes.WhiteSmoke;
@@ -394,8 +398,24 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 			}
 
+			// Live sound: green circle / up arrow = long, red circle / down arrow = short. One sound per bar; a circle
+			// decides when both fire (they rarely disagree, and the circle is the user's primary signal).
+			if (State == State.Realtime)
+			{
+				int circle = dSwing < 0 && hl ? 1 : dSwing > 0 && lh ? -1 : 0;
+				int signal = SoundOnCircles && circle != 0 ? circle : SoundOnArrows ? div : 0;
+				if (signal != 0)
+					PlaySound(SoundPath(signal > 0 ? LongSound : ShortSound));
+			}
+
 			if (logSession)
 				QueueLogLine(a);
+		}
+
+		// A bare file name is looked up in NinjaTrader's sounds folder; a full path is used as is
+		private static string SoundPath(string file)
+		{
+			return Path.IsPathRooted(file) ? file : Path.Combine(NinjaTrader.Core.Globals.InstallDir, "sounds", file);
 		}
 
 		// Delta low (high) within a bar of the price swing bar: the delta extreme rarely lands on the exact same bar
@@ -620,6 +640,75 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Display(Name = "Log folder", Order = 2, GroupName = "4. Logger")]
 		public string LogFolder { get; set; }
+
+		[Display(Name = "Sound on circles", Description = "Live only: green circle (delta higher low) = long sound, red circle (delta lower high) = short sound.", Order = 1, GroupName = "5. Alerts")]
+		public bool SoundOnCircles { get; set; }
+
+		[Display(Name = "Sound on arrows", Description = "Live only: up / down divergence arrow. A circle on the same bar wins.", Order = 2, GroupName = "5. Alerts")]
+		public bool SoundOnArrows { get; set; }
+
+		[Display(Name = "Long sound", Description = "File in NinjaTrader's sounds folder, or a full path to any .wav.", Order = 3, GroupName = "5. Alerts")]
+		public string LongSound { get; set; }
+
+		[Display(Name = "Short sound", Description = "File in NinjaTrader's sounds folder, or a full path to any .wav.", Order = 4, GroupName = "5. Alerts")]
+		public string ShortSound { get; set; }
 		#endregion
 	}
 }
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private DeltaConfluence[] cacheDeltaConfluence;
+		public DeltaConfluence DeltaConfluence(DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
+		{
+			return DeltaConfluence(Input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
+		}
+
+		public DeltaConfluence DeltaConfluence(ISeries<double> input, DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
+		{
+			if (cacheDeltaConfluence != null)
+				for (int idx = 0; idx < cacheDeltaConfluence.Length; idx++)
+					if (cacheDeltaConfluence[idx] != null && cacheDeltaConfluence[idx].ResetMode == resetMode && cacheDeltaConfluence[idx].EmaFast == emaFast && cacheDeltaConfluence[idx].EmaSlow == emaSlow && cacheDeltaConfluence[idx].DeltaSwingMult == deltaSwingMult && cacheDeltaConfluence[idx].DeltaSwingBars == deltaSwingBars && cacheDeltaConfluence[idx].PriceEmaPeriod == priceEmaPeriod && cacheDeltaConfluence[idx].PriceSwingSd == priceSwingSd && cacheDeltaConfluence[idx].MinSwingPts == minSwingPts && cacheDeltaConfluence[idx].DivToleranceTicks == divToleranceTicks && cacheDeltaConfluence[idx].EqualsInput(input))
+						return cacheDeltaConfluence[idx];
+			return CacheIndicator<DeltaConfluence>(new DeltaConfluence(){ ResetMode = resetMode, EmaFast = emaFast, EmaSlow = emaSlow, DeltaSwingMult = deltaSwingMult, DeltaSwingBars = deltaSwingBars, PriceEmaPeriod = priceEmaPeriod, PriceSwingSd = priceSwingSd, MinSwingPts = minSwingPts, DivToleranceTicks = divToleranceTicks }, input, ref cacheDeltaConfluence);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.DeltaConfluence DeltaConfluence(DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
+		{
+			return indicator.DeltaConfluence(Input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
+		}
+
+		public Indicators.DeltaConfluence DeltaConfluence(ISeries<double> input , DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
+		{
+			return indicator.DeltaConfluence(input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.DeltaConfluence DeltaConfluence(DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
+		{
+			return indicator.DeltaConfluence(Input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
+		}
+
+		public Indicators.DeltaConfluence DeltaConfluence(ISeries<double> input , DeltaResetMode resetMode, int emaFast, int emaSlow, double deltaSwingMult, int deltaSwingBars, int priceEmaPeriod, double priceSwingSd, double minSwingPts, int divToleranceTicks)
+		{
+			return indicator.DeltaConfluence(input, resetMode, emaFast, emaSlow, deltaSwingMult, deltaSwingBars, priceEmaPeriod, priceSwingSd, minSwingPts, divToleranceTicks);
+		}
+	}
+}
+
+#endregion
