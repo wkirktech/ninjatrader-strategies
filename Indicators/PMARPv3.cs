@@ -22,6 +22,11 @@ using NinjaTrader.NinjaScript;
 //   warning     slope flattens after a run, or turns the other way
 //   high alert  PMARP crosses its signal line (second voice, interrupts anything queued)
 //   continue    the run holds: once when it reaches 80 / 20, then every ContinuationMin minutes
+// Trend range (closed bars): RangeCloses closes >= RangeStartLevel within RangeWindowBars bars start an uptrend range,
+//   held while PMARP stays >= UpFloor (mirror: <= 100 - RangeStartLevel, held while <= DownCeiling). Shaded with a dotted
+//   floor / ceiling line; voice on start (high), on the break (high) and every ContinuationMin minutes while it holds.
+//   Inside a range, crosses are said as pullbacks / dips and warnings against the range are muted (the break covers them).
+//   Context only: the 2026-11-10 backtests found no edge in trading the range (analysis\research\2026-11-10_pmarp_trend_*.md).
 namespace NinjaTrader.NinjaScript.Indicators
 {
 	public class PMARPv3 : Indicator
@@ -56,15 +61,27 @@ namespace NinjaTrader.NinjaScript.Indicators
 				CooldownSec = 120;
 				SpeechRate = 1;
 				HighAlertVoice = "Microsoft Zira Desktop";
+				TrendRange = true;
+				RangeStartLevel = 90;
+				RangeCloses = 3;
+				RangeWindowBars = 12;
+				UpFloor = 40;
+				DownCeiling = 20;
+				ShadeRange = true;
 
 				AddPlot(new Stroke(Brushes.DodgerBlue, 2), PlotStyle.Line, "PMARP");
 				AddPlot(new Stroke(Brushes.Orange, 1), PlotStyle.Line, "Signal");
+				AddPlot(new Stroke(Brushes.Gold, DashStyleHelper.Dot, 1), PlotStyle.Line, "Range");
 				AddLine(Brushes.Gray, 80, "High");
 				AddLine(Brushes.DimGray, 50, "Mid");
 				AddLine(Brushes.Gray, 20, "Low");
 			}
 			else if (State == State.DataLoaded)
+			{
 				pmar = new Series<double>(this, MaximumBarsLookBack.Infinite);
+				upShade = new SolidColorBrush(Color.FromArgb(35, 50, 205, 50)); upShade.Freeze();
+				downShade = new SolidColorBrush(Color.FromArgb(35, 255, 69, 0)); downShade.Freeze();
+			}
 			else if (State == State.Historical)
 				chartControlRef = ChartControl;
 			else if (State == State.Terminated && chartControlRef != null && voice != null)
@@ -81,6 +98,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private bool startSaid;
 		private double runExt;
 		private readonly HashSet<string> saidThisBar = new HashSet<string>();
+		private int range;   // +1 uptrend range, -1 downtrend range, 0 none (closed bars)
+		private DateTime rangeSince, rangeSaid;
+		private Brush upShade, downShade;
 
 		protected override void OnBarUpdate()
 		{
@@ -113,11 +133,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 			string tf = "P MARP " + TimeframeWords();
 			double pm = Value[0];
 			int cross = Value[0] > Signal[0] && Value[1] <= Signal[1] ? 1 : Value[0] < Signal[0] && Value[1] >= Signal[1] ? -1 : 0;
-			if (cross != 0 && Once("cross " + cross))
+			string rn = range > 0 ? "Uptrend range" : "Downtrend range";
+			if (cross != 0 && range != 0 && Once("cross " + cross))
+			{
+				if (cross == range)   // back with the range: a dip (rally) turning
+					Say(string.Format("{0}. {1} {2} turning {3}, crossed {4} its signal at {5:0}.", rn, tf, range > 0 ? "dip" : "rally", range > 0 ? "up" : "down", cross > 0 ? "above" : "below", pm), true);
+				else
+					Say(string.Format("{0} pullback. {1} crossed {2} its signal at {3:0}. Range holds {4} {5:0}.", rn, tf, cross > 0 ? "above" : "below", pm, range > 0 ? "above" : "below", range > 0 ? UpFloor : DownCeiling), false);
+			}
+			else if (cross != 0 && Once("cross " + cross))
 				Say(string.Format("High alert. {0} crossed {1} its signal line, at {2:0}.", tf, cross > 0 ? "above" : "below", pm), true);
-			else if (now != 0 && lastDir != 0 && now != lastDir && Once("turn " + now))
-				Say(string.Format("Warning. {0} turning {1} from {2:0}, now {3:0}.", tf, now > 0 ? "up" : "down", runExt, pm), false);
-			else if (now == 0 && state != 0 && Once("flat " + state))
+			else if (now != 0 && lastDir != 0 && now != lastDir && (range == 0 || now == range) && Once("turn " + now))
+				Say(string.Format("{0}. {1} turning {2} from {3:0}, now {4:0}.", range != 0 ? rn : "Warning", tf, now > 0 ? "up" : "down", runExt, pm), false);
+			else if (now == 0 && state != 0 && range == 0 && Once("flat " + state))
 				Say(string.Format("Warning. {0} flattening after a {1}, at {2:0}.", tf, state > 0 ? "rise" : "drop", pm), false);
 		}
 
@@ -143,8 +171,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 			else if (lastDir > 0) runExt = Math.Max(runExt, v);
 			else if (lastDir < 0) runExt = Math.Min(runExt, v);
 			if (now != state) { runSince = Time[ago]; extremeSaid = false; }
+			UpdateRange(ago);
 
-			if (State == State.Realtime && VoiceAlerts && now != 0 && now == state)
+			if (State == State.Realtime && VoiceAlerts && now != 0 && now == state && range == 0)
 			{
 				string tf = "P MARP " + TimeframeWords();
 				bool extreme = now > 0 ? v >= 80 : v <= 20;
@@ -160,6 +189,47 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 			}
 			state = now;
+		}
+
+		// Trend range on a closed bar: break first, then a new start; shade + floor line while it holds
+		private void UpdateRange(int ago)
+		{
+			if (!TrendRange) { range = 0; return; }
+			double v = Value[ago], lowStart = 100 - RangeStartLevel;
+			int hi = 0, lo = 0;
+			for (int k = ago; k < ago + RangeWindowBars && k <= CurrentBar - VwmaPeriod - Lookback; k++)   // only bars with a PMARP value
+			{
+				if (Value[k] >= RangeStartLevel) hi++;
+				if (Value[k] <= lowStart) lo++;
+			}
+			bool talk = State == State.Realtime && VoiceAlerts;
+			string tf = "P MARP " + TimeframeWords();
+			if ((range > 0 && v < UpFloor) || (range < 0 && v > DownCeiling))
+			{
+				if (talk)
+					Say(string.Format("{0} {1} range broken {2} {3:0}, after {4:0} minutes. Now {5:0}.", tf, range > 0 ? "uptrend" : "downtrend",
+						range > 0 ? "below" : "above", range > 0 ? UpFloor : DownCeiling, (Time[ago] - rangeSince).TotalMinutes, v), true);
+				range = 0;
+			}
+			int start = hi >= RangeCloses && v >= RangeStartLevel ? 1 : lo >= RangeCloses && v <= lowStart ? -1 : 0;
+			if (start != 0 && start != range)
+			{
+				range = start; rangeSince = rangeSaid = Time[ago];
+				if (talk)
+					Say(string.Format("{0} {1} range. Holding {2} {3:0}.", tf, start > 0 ? "uptrend" : "downtrend", start > 0 ? "above" : "below", start > 0 ? UpFloor : DownCeiling), true);
+			}
+			else if (range != 0 && talk && ContinuationMin > 0 && (Time[ago] - rangeSaid).TotalMinutes >= ContinuationMin)
+			{
+				rangeSaid = Time[ago];
+				Say(string.Format("{0} range holding, {1:0} minutes, at {2:0}.", range > 0 ? "Uptrend" : "Downtrend", (Time[ago] - rangeSince).TotalMinutes, v), false);
+			}
+			if (range != 0)
+			{
+				Values[2][ago] = range > 0 ? UpFloor : DownCeiling;
+				if (ShadeRange) BackBrushes[ago] = range > 0 ? upShade : downShade;
+			}
+			else
+				Values[2].Reset(ago);
 		}
 
 		// once per bar per alert, and not again within the cooldown
@@ -265,6 +335,32 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Display(Name = "High alert voice", Description = "e.g. Microsoft Zira Desktop or Microsoft David Desktop.", Order = 5, GroupName = "Voice")]
 		public string HighAlertVoice { get; set; }
+
+		[Display(Name = "Trend range", Description = "Detect PMARP trend ranges (shade, floor line, voice).", Order = 1, GroupName = "Trend range")]
+		public bool TrendRange { get; set; }
+
+		[Range(50, 100)]
+		[Display(Name = "Start level", Description = "Closes at or above this start an uptrend range; at or below 100 minus this a downtrend range.", Order = 2, GroupName = "Trend range")]
+		public double RangeStartLevel { get; set; }
+
+		[Range(1, 50)]
+		[Display(Name = "Start closes", Description = "This many closes past the start level...", Order = 3, GroupName = "Trend range")]
+		public int RangeCloses { get; set; }
+
+		[Range(1, 100)]
+		[Display(Name = "Within bars", Description = "...within this many bars.", Order = 4, GroupName = "Trend range")]
+		public int RangeWindowBars { get; set; }
+
+		[Range(0, 100)]
+		[Display(Name = "Uptrend floor", Description = "The uptrend range holds while PMARP stays at or above this; a close below breaks it.", Order = 5, GroupName = "Trend range")]
+		public double UpFloor { get; set; }
+
+		[Range(0, 100)]
+		[Display(Name = "Downtrend ceiling", Description = "The downtrend range holds while PMARP stays at or below this; a close above breaks it.", Order = 6, GroupName = "Trend range")]
+		public double DownCeiling { get; set; }
+
+		[Display(Name = "Shade range", Order = 7, GroupName = "Trend range")]
+		public bool ShadeRange { get; set; }
 		#endregion
 	}
 }
