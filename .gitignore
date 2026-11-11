@@ -21,3 +21,4 @@
 !/Indicators/DeltaConfluence.cs
 !/Indicators/BarLogger.cs
 !/Indicators/AutoCenterPrice.cs
+!/Indicators/BigTrades.cs

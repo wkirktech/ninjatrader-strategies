@@ -17,11 +17,14 @@ using NinjaTrader.NinjaScript;
 // Writes every closed bar of the chart's series (OHLCV) to one CSV for offline research, e.g. daily-bias and
 // session-level backtests. Intraday times are converted to US Eastern; daily bars keep their session date.
 // Load the chart on a continuous, back-adjusted contract (NQ ##-##) or roll gaps show up as fake price gaps.
+// On a 1-tick chart each bar is one trade: rows become time (ms), price, size and aggressor side
+// (1 = at/above the ask = market buy, -1 = at/below the bid = market sell, 0 = inside the spread).
 namespace NinjaTrader.NinjaScript.Indicators
 {
 	public class BarLogger : Indicator
 	{
-		private const string LogHeader = "date_et,time_et,open,high,low,close,volume";
+		private const string BarHeader = "date_et,time_et,open,high,low,close,volume";
+		private const string TradeHeader = "date_et,time_et,price,size,side";
 		private static readonly HashSet<string> pathsInUse = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // one writer per file across charts
 
 		// Lines are queued on the indicator thread and written by a timer on a pool thread
@@ -35,6 +38,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private bool ownsPath;      // claimed on the first flush, after an old copy on a reloaded chart has released it
 		private volatile bool skipLog;   // another chart owns the file
 		private bool isDaily;
+		private bool isTrades;      // 1-tick chart: one row per trade with aggressor side
+		private string logHeader;
 		private TimeZoneInfo eastern;
 		private int rows;
 		private DateTime firstTime, lastTime;
@@ -55,6 +60,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				isDaily = BarsPeriod.BarsPeriodType == BarsPeriodType.Day || BarsPeriod.BarsPeriodType == BarsPeriodType.Week
 					|| BarsPeriod.BarsPeriodType == BarsPeriodType.Month || BarsPeriod.BarsPeriodType == BarsPeriodType.Year;
+				isTrades = BarsPeriod.BarsPeriodType == BarsPeriodType.Tick && BarsPeriod.Value == 1;
+				logHeader = isTrades ? TradeHeader : BarHeader;
 				eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");   // handles DST
 				logPath = Path.Combine(LogFolder, Instrument.MasterInstrument.Name + "_"
 					+ BarsPeriod.Value.ToString(CultureInfo.InvariantCulture) + BarsPeriod.BarsPeriodType.ToString() + ".csv");
@@ -106,6 +113,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			CultureInfo ci = CultureInfo.InvariantCulture;
 			StringBuilder sb = new StringBuilder(80);
+			if (isTrades)
+			{
+				double price = Close[0];
+				int side = price >= Bars.GetAsk(CurrentBar) ? 1 : price <= Bars.GetBid(CurrentBar) ? -1 : 0;
+				sb.Append(t.ToString("yyyy-MM-dd", ci)).Append(',').Append(t.ToString("HH:mm:ss.fff", ci)).Append(',')
+					.Append(price.ToString(ci)).Append(',').Append(Volume[0].ToString(ci)).Append(',').Append(side.ToString(ci));
+				lock (logLock)
+					logQueue.Add(sb.ToString());
+				return;
+			}
 			sb.Append(t.ToString("yyyy-MM-dd", ci)).Append(',').Append(isDaily ? "" : t.ToString("HH:mm:ss", ci)).Append(',')
 				.Append(Open[0].ToString(ci)).Append(',').Append(High[0].ToString(ci)).Append(',').Append(Low[0].ToString(ci)).Append(',').Append(Close[0].ToString(ci)).Append(',')
 				.Append(Volume[0].ToString(ci));
@@ -149,7 +166,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 					using (StreamWriter w = new StreamWriter(logPath, fileStarted))
 					{
 						if (!fileStarted)
-							w.Write(LogHeader + "\r\n");
+							w.Write(logHeader + "\r\n");
 						foreach (string line in batch)
 							w.Write(line + "\r\n");
 					}
