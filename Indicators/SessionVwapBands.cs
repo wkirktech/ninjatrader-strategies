@@ -12,17 +12,20 @@ using NinjaTrader.NinjaScript;
 #endregion
 
 // Session VWAP with volume-weighted standard deviation bands, half-band midlines and range midpoints, for mean reversion.
-//   Session: bars whose close time (exchange time zone, e.g. CT for CME) is after SessionStart and at or before SessionEnd.
-//   Default 08:30-15:15 CT, Close price, 1/2/3 SD: set up to match TTN ZWAPBandos on the 377 chart.
+//   Anchor TradingHours: resets on the chart's trading-hours session (Globex, 17:00 CT for CME index futures).
+//   Anchor Custom: bars whose close time (exchange time zone, CT for CME) is after SessionStart and at or before SessionEnd.
+//   Defaults (TradingHours, OHLC/4, 1/2/3 SD) match TTN ZWAPBandos on the 377 chart: checked 2026-11-10, VWAP exact,
+//   SD within 0.002 pt (its Full_Session mode ignores the custom times).
 //   VWAP = sum(v*p) / sum(v); SD = sqrt(sum(v*p^2) / sum(v) - VWAP^2), with p measured from the session's first open so
 //   the sums keep their precision. Bands = VWAP +/- Sd1/Sd2/Sd3 x SD; midlines sit halfway between neighbouring lines.
 //   Z = (close - VWAP) / SD, for strategies and the Python twin (analysis\research\scripts\session_vwap_bands.py).
-// Range midpoints (each plotted only once it is fully known, so no look-ahead):
+// Range midpoints on the SessionStart-SessionEnd window whatever the anchor (plotted inside that window, once fully known):
 //   prior session mid  (high + low) / 2 of the previous session window
 //   overnight mid      (high + low) / 2 of the bars between the previous session end and this session start
 //   IB mid             (high + low) / 2 of the first IbMinutes of the session, from the IB's end
 // Every value is per bar and rebuilt from the bar before, so the forming bar can be recalculated on each tick.
 public enum SessionVwapPrice { Close, Typical, Ohlc4 }
+public enum SessionVwapAnchor { TradingHours, Custom }
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
@@ -47,7 +50,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				PaintPriceMarkers = true;
 				IsSuspendedWhileInactive = true;
 
-				PriceSource = SessionVwapPrice.Close;
+				Anchor = SessionVwapAnchor.TradingHours;
+				PriceSource = SessionVwapPrice.Ohlc4;
 				SessionStart = "08:30";
 				SessionEnd = "15:15";
 				Sd1 = 1;
@@ -95,10 +99,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 		protected override void OnBarUpdate()
 		{
 			DateTime t0 = Exchange(Time[0]);
-			bool in0 = InSession(t0);
-			bool in1 = CurrentBar > 0 && InSession(Exchange(Time[1]));
-			bool sameSession = in0 && in1 && Exchange(Time[1]).Date == t0.Date;
-			bool newSession = in0 && !sameSession;
+			bool rth0 = InSession(t0);
+			bool rth1 = CurrentBar > 0 && InSession(Exchange(Time[1]));
+			bool newRth = rth0 && !(rth1 && Exchange(Time[1]).Date == t0.Date);
+			bool custom = Anchor == SessionVwapAnchor.Custom;
+			bool in0 = custom ? rth0 : true;
+			bool newSession = custom ? newRth : CurrentBar == 0 || Bars.IsFirstBarOfSession;
 
 			// Carry the range trackers forward (session high/low lives on through the overnight as the prior session)
 			double sh = CurrentBar > 0 ? sessHigh[1] : double.NaN, sl = CurrentBar > 0 ? sessLow[1] : double.NaN;
@@ -106,7 +112,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			double pm = CurrentBar > 0 ? priorMid[1] : double.NaN, om = CurrentBar > 0 ? onMid[1] : double.NaN;
 			double ih = CurrentBar > 0 ? ibHigh[1] : double.NaN, il = CurrentBar > 0 ? ibLow[1] : double.NaN;
 
-			if (newSession)
+			if (newRth)
 			{
 				pm = Mid(sh, sl);          // last session's range is complete
 				om = Mid(oh, ol);          // so is the overnight
@@ -114,7 +120,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				oh = ol = double.NaN;
 				ih = High[0]; il = Low[0];
 			}
-			else if (in0)
+			else if (rth0)
 			{
 				sh = Math.Max(sh, High[0]); sl = Math.Min(sl, Low[0]);
 				if (t0.TimeOfDay <= start.Add(TimeSpan.FromMinutes(IbMinutes))) { ih = Math.Max(ih, High[0]); il = Math.Min(il, Low[0]); }
@@ -151,7 +157,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				Values[7][0] = vwap + Sd1 * sd / 2; Values[8][0] = vwap + (Sd1 + Sd2) * sd / 2; Values[9][0] = vwap + (Sd2 + Sd3) * sd / 2;
 				Values[10][0] = vwap - Sd1 * sd / 2; Values[11][0] = vwap - (Sd1 + Sd2) * sd / 2; Values[12][0] = vwap - (Sd2 + Sd3) * sd / 2;
 			}
-			if (ShowRangeMids)
+			if (ShowRangeMids && rth0)
 			{
 				if (!double.IsNaN(pm)) Values[13][0] = pm;
 				if (!double.IsNaN(om)) Values[14][0] = om;
@@ -207,11 +213,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Browsable(false)] [XmlIgnore] public Series<double> Z { get { return zScore; } }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Price", Description = "Price weighted into the VWAP. Close matches ZWAPBandos on the 377 chart.", Order = 1, GroupName = "VWAP")]
+		[Display(Name = "Anchor", Description = "TradingHours = reset with the chart's session (Globex, like ZWAPBandos Full_Session). Custom = the session window below.", Order = 0, GroupName = "VWAP")]
+		public SessionVwapAnchor Anchor { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Price", Description = "Price weighted into the VWAP. OHLC/4 matches ZWAPBandos on the 377 chart.", Order = 1, GroupName = "VWAP")]
 		public SessionVwapPrice PriceSource { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Session start (HH:mm)", Description = "Exchange time zone (CT for CME). Bars closing after this start the session.", Order = 2, GroupName = "VWAP")]
+		[Display(Name = "Session start (HH:mm)", Description = "Exchange time zone (CT for CME). Custom anchor: bars closing after this start the session. Also the range-midpoint window.", Order = 2, GroupName = "VWAP")]
 		public string SessionStart { get; set; }
 
 		[NinjaScriptProperty]
@@ -254,18 +264,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
 	{
 		private SessionVwapBands[] cacheSessionVwapBands;
-		public SessionVwapBands SessionVwapBands(SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
+		public SessionVwapBands SessionVwapBands(SessionVwapAnchor anchor, SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
 		{
-			return SessionVwapBands(Input, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
+			return SessionVwapBands(Input, anchor, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
 		}
 
-		public SessionVwapBands SessionVwapBands(ISeries<double> input, SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
+		public SessionVwapBands SessionVwapBands(ISeries<double> input, SessionVwapAnchor anchor, SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
 		{
 			if (cacheSessionVwapBands != null)
 				for (int idx = 0; idx < cacheSessionVwapBands.Length; idx++)
-					if (cacheSessionVwapBands[idx] != null && cacheSessionVwapBands[idx].PriceSource == priceSource && cacheSessionVwapBands[idx].SessionStart == sessionStart && cacheSessionVwapBands[idx].SessionEnd == sessionEnd && cacheSessionVwapBands[idx].Sd1 == sd1 && cacheSessionVwapBands[idx].Sd2 == sd2 && cacheSessionVwapBands[idx].Sd3 == sd3 && cacheSessionVwapBands[idx].IbMinutes == ibMinutes && cacheSessionVwapBands[idx].EqualsInput(input))
+					if (cacheSessionVwapBands[idx] != null && cacheSessionVwapBands[idx].Anchor == anchor && cacheSessionVwapBands[idx].PriceSource == priceSource && cacheSessionVwapBands[idx].SessionStart == sessionStart && cacheSessionVwapBands[idx].SessionEnd == sessionEnd && cacheSessionVwapBands[idx].Sd1 == sd1 && cacheSessionVwapBands[idx].Sd2 == sd2 && cacheSessionVwapBands[idx].Sd3 == sd3 && cacheSessionVwapBands[idx].IbMinutes == ibMinutes && cacheSessionVwapBands[idx].EqualsInput(input))
 						return cacheSessionVwapBands[idx];
-			return CacheIndicator<SessionVwapBands>(new SessionVwapBands(){ PriceSource = priceSource, SessionStart = sessionStart, SessionEnd = sessionEnd, Sd1 = sd1, Sd2 = sd2, Sd3 = sd3, IbMinutes = ibMinutes }, input, ref cacheSessionVwapBands);
+			return CacheIndicator<SessionVwapBands>(new SessionVwapBands(){ Anchor = anchor, PriceSource = priceSource, SessionStart = sessionStart, SessionEnd = sessionEnd, Sd1 = sd1, Sd2 = sd2, Sd3 = sd3, IbMinutes = ibMinutes }, input, ref cacheSessionVwapBands);
 		}
 	}
 }
@@ -274,14 +284,14 @@ namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
 {
 	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
 	{
-		public Indicators.SessionVwapBands SessionVwapBands(SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
+		public Indicators.SessionVwapBands SessionVwapBands(SessionVwapAnchor anchor, SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
 		{
-			return indicator.SessionVwapBands(Input, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
+			return indicator.SessionVwapBands(Input, anchor, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
 		}
 
-		public Indicators.SessionVwapBands SessionVwapBands(ISeries<double> input , SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
+		public Indicators.SessionVwapBands SessionVwapBands(ISeries<double> input , SessionVwapAnchor anchor, SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
 		{
-			return indicator.SessionVwapBands(input, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
+			return indicator.SessionVwapBands(input, anchor, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
 		}
 	}
 }
@@ -290,14 +300,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
 	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
 	{
-		public Indicators.SessionVwapBands SessionVwapBands(SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
+		public Indicators.SessionVwapBands SessionVwapBands(SessionVwapAnchor anchor, SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
 		{
-			return indicator.SessionVwapBands(Input, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
+			return indicator.SessionVwapBands(Input, anchor, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
 		}
 
-		public Indicators.SessionVwapBands SessionVwapBands(ISeries<double> input , SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
+		public Indicators.SessionVwapBands SessionVwapBands(ISeries<double> input , SessionVwapAnchor anchor, SessionVwapPrice priceSource, string sessionStart, string sessionEnd, double sd1, double sd2, double sd3, int ibMinutes)
 		{
-			return indicator.SessionVwapBands(input, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
+			return indicator.SessionVwapBands(input, anchor, priceSource, sessionStart, sessionEnd, sd1, sd2, sd3, ibMinutes);
 		}
 	}
 }
