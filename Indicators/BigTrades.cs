@@ -38,6 +38,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			public long Size;
 			public int Side;            // 1 buy, -1 sell
 			public int Outcome;         // 0 pending, 1 aggression, 2 absorption, 3 neither
+			public bool IsLive;         // formed after the chart went live (only these are logged)
 		}
 
 		// Group being built for each side (index 0 = buys, 1 = sells)
@@ -190,7 +191,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DateTime et = TimeZoneInfo.ConvertTime(DateTime.SpecifyKind(grpLast[g], DateTimeKind.Unspecified), NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo, eastern);
 			if (size >= Threshold(et, size))
 			{
-				Bubble bb = new Bubble { Time = grpLast[g], Price = grpPV[g] / size, Lo = grpLo[g], Hi = grpHi[g], Size = size, Side = g == 0 ? 1 : -1 };
+				Bubble bb = new Bubble { Time = grpLast[g], Price = grpPV[g] / size, Lo = grpLo[g], Hi = grpHi[g], Size = size, Side = g == 0 ? 1 : -1, IsLive = State == State.Realtime };
 				lock (bubbleLock)
 					bubbles.Add(bb);
 				pending.Add(bb);
@@ -283,7 +284,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 					continue;
 				bb.Outcome = outcome;
 				pending.RemoveAt(i);
-				if (LogBubbles && State == State.Realtime)
+				if (LogBubbles && bb.IsLive)
 					QueueLog(bb);
 			}
 		}
@@ -310,6 +311,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				batch = logQueue;
 				logQueue = new List<string>();
 			}
+			int written = 0;
 			try
 			{
 				Directory.CreateDirectory(LogFolder);
@@ -323,13 +325,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 							w.Write("date_et,time_et,side,size,price,low,high,outcome\r\n");
 						w.Write(line + "\r\n");
 					}
+					written++;
 				}
 			}
 			catch (Exception ex)
 			{
-				// File locked (OneDrive, Excel): keep the rows and retry on the next tick
+				// File locked (OneDrive, Excel): keep the rows not yet written and retry on the next tick
 				lock (logLock)
 				{
+					batch.RemoveRange(0, written);
 					batch.AddRange(logQueue);
 					logQueue = batch;
 				}
