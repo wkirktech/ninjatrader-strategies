@@ -36,6 +36,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				IntervalSeconds = 30;
 				EdgeZonePercent = 20;
 				PauseWhileMouseOver = true;
+				ShowLabel = false;
 			}
 			else if (State == State.Historical)
 			{
@@ -113,7 +114,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
+		// Hide the name in the chart's top-left label area unless asked; the Indicators dialog still shows it
+		public override string DisplayName { get { return ShowLabel || State == State.SetDefaults ? Name : string.Empty; } }
+
 		#region Properties
+		[Display(Name = "Show label", Description = "Show the indicator's name in the chart's top-left label area.", Order = 99, GroupName = "Parameters")]
+		public bool ShowLabel { get; set; }
+
 		[NinjaScriptProperty]
 		[Display(Name = "Enabled", Description = "Turn the re-centring on or off.", GroupName = "Parameters", Order = 0)]
 		public bool Enabled { get; set; }
@@ -134,3 +141,60 @@ namespace NinjaTrader.NinjaScript.Indicators
 		#endregion
 	}
 }
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private AutoCenterPrice[] cacheAutoCenterPrice;
+		public AutoCenterPrice AutoCenterPrice(bool enabled, int intervalSeconds, int edgeZonePercent, bool pauseWhileMouseOver)
+		{
+			return AutoCenterPrice(Input, enabled, intervalSeconds, edgeZonePercent, pauseWhileMouseOver);
+		}
+
+		public AutoCenterPrice AutoCenterPrice(ISeries<double> input, bool enabled, int intervalSeconds, int edgeZonePercent, bool pauseWhileMouseOver)
+		{
+			if (cacheAutoCenterPrice != null)
+				for (int idx = 0; idx < cacheAutoCenterPrice.Length; idx++)
+					if (cacheAutoCenterPrice[idx] != null && cacheAutoCenterPrice[idx].Enabled == enabled && cacheAutoCenterPrice[idx].IntervalSeconds == intervalSeconds && cacheAutoCenterPrice[idx].EdgeZonePercent == edgeZonePercent && cacheAutoCenterPrice[idx].PauseWhileMouseOver == pauseWhileMouseOver && cacheAutoCenterPrice[idx].EqualsInput(input))
+						return cacheAutoCenterPrice[idx];
+			return CacheIndicator<AutoCenterPrice>(new AutoCenterPrice(){ Enabled = enabled, IntervalSeconds = intervalSeconds, EdgeZonePercent = edgeZonePercent, PauseWhileMouseOver = pauseWhileMouseOver }, input, ref cacheAutoCenterPrice);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.AutoCenterPrice AutoCenterPrice(bool enabled, int intervalSeconds, int edgeZonePercent, bool pauseWhileMouseOver)
+		{
+			return indicator.AutoCenterPrice(Input, enabled, intervalSeconds, edgeZonePercent, pauseWhileMouseOver);
+		}
+
+		public Indicators.AutoCenterPrice AutoCenterPrice(ISeries<double> input , bool enabled, int intervalSeconds, int edgeZonePercent, bool pauseWhileMouseOver)
+		{
+			return indicator.AutoCenterPrice(input, enabled, intervalSeconds, edgeZonePercent, pauseWhileMouseOver);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.AutoCenterPrice AutoCenterPrice(bool enabled, int intervalSeconds, int edgeZonePercent, bool pauseWhileMouseOver)
+		{
+			return indicator.AutoCenterPrice(Input, enabled, intervalSeconds, edgeZonePercent, pauseWhileMouseOver);
+		}
+
+		public Indicators.AutoCenterPrice AutoCenterPrice(ISeries<double> input , bool enabled, int intervalSeconds, int edgeZonePercent, bool pauseWhileMouseOver)
+		{
+			return indicator.AutoCenterPrice(input, enabled, intervalSeconds, edgeZonePercent, pauseWhileMouseOver);
+		}
+	}
+}
+
+#endregion
