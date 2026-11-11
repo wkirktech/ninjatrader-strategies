@@ -75,6 +75,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private readonly Dictionary<string, double> setStop = new Dictionary<string, double>(), dragged = new Dictionary<string, double>();
 		private readonly Dictionary<string, double> setTgt = new Dictionary<string, double>(), tdragged = new Dictionary<string, double>();
 		private double fillPx = double.NaN;
+		// price extremes since the fill (MFE / MAE and runner BE ignore ticks before it)
+		private double hiSince = double.NaN, loSince = double.NaN;
+		// open contracts per leg (entry fills minus exits), and when each open leg was first seen without a stop
+		private readonly Dictionary<string, int> legQty = new Dictionary<string, int>();
+		private readonly Dictionary<string, DateTime> noStopSince = new Dictionary<string, DateTime>();
 
 		// day limits
 		private DateTime tradeDay = DateTime.MinValue;
@@ -189,9 +194,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			DayRoll();
 			ProcessPending();
-			if (inTrade)
+			if (inTrade && !double.IsNaN(fillPx))
 			{
-				double up = High[0] - tEntry, dn = tEntry - Low[0];
+				hiSince = double.IsNaN(hiSince) ? Close[0] : Math.Max(hiSince, Close[0]);
+				loSince = double.IsNaN(loSince) ? Close[0] : Math.Min(loSince, Close[0]);
+				double up = hiSince - fillPx, dn = fillPx - loSince;
 				tMfe = Math.Max(tMfe, tDir > 0 ? up : dn);
 				tMae = Math.Max(tMae, tDir > 0 ? dn : up);
 			}
@@ -208,7 +215,41 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (d != tradeDay)
 			{
 				tradeDay = d; tradesToday = 0; lossesToday = 0; pnlToday = 0;
+				LoadDay();
 			}
+		}
+
+		// Day limits survive a restart / reload: saved after each closed trade, read back for the same account and trade day
+		private string DayFile()
+		{
+			string acct = Account != null ? Account.Name : "none";
+			foreach (char ch in Path.GetInvalidFileNameChars()) acct = acct.Replace(ch, '_');
+			return Path.Combine(Core.Globals.UserDataDir, "analysis", "playbooks", "executor_day_" + acct + ".txt");
+		}
+
+		private void LoadDay()
+		{
+			try
+			{
+				string path = DayFile();
+				if (!File.Exists(path)) return;
+				CultureInfo ci = CultureInfo.InvariantCulture;
+				string[] f = File.ReadAllText(path).Trim().Split(',');
+				if (f.Length < 6 || f[0] != tradeDay.ToString("yyyy-MM-dd", ci)) return;
+				tradesToday = int.Parse(f[1], ci); lossesToday = int.Parse(f[2], ci); pnlToday = double.Parse(f[3], ci);
+				lastLossDir = int.Parse(f[4], ci); lastLossTime = new DateTime(long.Parse(f[5], ci));
+				statusMsg = string.Format("today so far: {0} trades, {1} losses, {2}{3:N0}", tradesToday, lossesToday, pnlToday >= 0 ? "+$" : "-$", Math.Abs(pnlToday));
+			}
+			catch (Exception ex) { Print("PlaybookExecutor day file: " + ex.Message); }
+		}
+
+		private void SaveDay()
+		{
+			CultureInfo ci = CultureInfo.InvariantCulture;
+			string line = string.Join(",", tradeDay.ToString("yyyy-MM-dd", ci), tradesToday.ToString(ci), lossesToday.ToString(ci),
+				pnlToday.ToString("0.00", ci), lastLossDir.ToString(ci), lastLossTime.Ticks.ToString(ci));
+			try { File.WriteAllText(DayFile(), line); }
+			catch (Exception ex) { Print("PlaybookExecutor day file: " + ex.Message); }
 		}
 
 		private int Ladder()
@@ -265,10 +306,25 @@ namespace NinjaTrader.NinjaScript.Strategies
 			return qty;
 		}
 
+		// Any open position on the account in this chart's or the execution instrument's root (e.g. a DOM trade, or one
+		// left from before a restart); null = none
+		private string AccountPosition()
+		{
+			if (Account == null) return null;
+			string a = Instrument.MasterInstrument.Name, b = Instruments[execIdx].MasterInstrument.Name;
+			lock (Account.Positions)
+				foreach (Position p in Account.Positions)
+					if (p.MarketPosition != MarketPosition.Flat && (p.Instrument.MasterInstrument.Name == a || p.Instrument.MasterInstrument.Name == b))
+						return string.Format("{0} {1} {2}", p.MarketPosition == MarketPosition.Long ? "long" : "short", p.Quantity, p.Instrument.FullName);
+			return null;
+		}
+
 		private string Blocked(int dir)
 		{
 			if (State != State.Realtime) return "not live yet";
 			if (inTrade || Positions[execIdx].MarketPosition != MarketPosition.Flat) return "already in a trade";
+			string held = AccountPosition();
+			if (held != null) return "account already holds " + held;
 			if (tradesToday >= MaxTradesPerDay) return tradesToday + " trades today: done for the day";
 			if (lossesToday >= MaxLossesPerDay) return lossesToday + " losses today: done for the day";
 			if (DailyLossUsd > 0 && pnlToday <= -DailyLossUsd) return "daily loss limit hit";
@@ -308,7 +364,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 			tStartEt = TimeZoneInfo.ConvertTime(tStartLocal, Core.Globals.GeneralOptions.TimeZoneInfo, eastern);
 			tCtx = panel.ContextText + (panel.Bias > 0 ? " / long bias" : panel.Bias < 0 ? " / short bias" : " / no bias");
 			tDayType = panel.DayTypeText; tLevel = panel.NearestLevelText; tZc = panel.ZCubedText; tTrap = panel.TrapText;
-			fillPx = double.NaN; lastExitKind = "";
+			fillPx = double.NaN; hiSince = loSince = double.NaN; lastExitKind = "";
+			lock (pxLock) { legQty.Clear(); noStopSince.Clear(); }
 			statusMsg = string.Format("{0} {1} {2} sent, {3} ({4:0.0} pts to the {5}-bar extreme)", dir > 0 ? "LONG" : "SHORT", qty,
 				Instruments[execIdx].FullName, tAtm, raw, StopLookbackBars);
 			RefreshUi();
@@ -391,9 +448,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 			double avg = Positions[execIdx].AveragePrice, be = avg + tDir * Instruments[execIdx].MasterInstrument.TickSize;
 			double last = Closes[execIdx][0];
 			if (tDir * (last - be) < 2 * TickSize) { statusMsg = "BE refused: price not past entry + 1 tick yet"; return; }
+			int moved = 0;
 			foreach (string leg in OpenLegs())
-				SetStop(leg, be);
-			statusMsg = "stop moved to breakeven " + be.ToString("0.00", CultureInfo.InvariantCulture);
+			{
+				double cur;
+				lock (pxLock) if (setStop.TryGetValue(leg, out cur) && tDir * (be - cur) <= 0) continue;   // already at or past BE
+				SetStop(leg, be); moved++;
+			}
+			statusMsg = moved > 0 ? "stop moved to breakeven " + be.ToString("0.00", CultureInfo.InvariantCulture) : "stop already at or past breakeven";
 		}
 
 		private void MoveTargetToLevel()
@@ -401,8 +463,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (!inTrade || Positions[execIdx].MarketPosition == MarketPosition.Flat) { statusMsg = "no open trade"; return; }
 			double entry = Positions[execIdx].AveragePrice;
 			double[] lv = panel.LevelPrices;
-			var c = lv.Where(p => tDir * (p - entry) >= tStopPts).OrderBy(p => Math.Abs(p - entry)).ToList();
-			if (c.Count == 0) { statusMsg = "no plan level at least 1R away"; return; }
+			double last = Closes[execIdx][0];
+			// at least 1R from entry and still ahead of price (a level already passed would fill the target at once)
+			var c = lv.Where(p => tDir * (p - entry) >= tStopPts && tDir * (p - tDir * TickSize - last) >= 2 * TickSize).OrderBy(p => Math.Abs(p - entry)).ToList();
+			if (c.Count == 0) { statusMsg = "no plan level at least 1R away and ahead of price"; return; }
 			double px = c[0] - tDir * TickSize;   // one tick in front of the level
 			string leg = tQty >= 2 ? Leg2 : Leg1;
 			if (!OpenLegs().Contains(leg)) { statusMsg = leg + " already closed"; return; }
@@ -432,9 +496,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (inTrade && !runnerBe && RunnerBreakevenR > 0 && OpenLegs().Contains(Leg2))
 			{
 				double avg = Positions[execIdx].AveragePrice, trig = avg + tDir * RunnerBreakevenR * tStopPts;
-				if (tDir > 0 ? Highs[0][0] >= trig : Lows[0][0] <= trig)
+				double be = avg + tDir * Instruments[execIdx].MasterInstrument.TickSize;
+				bool reached = tDir > 0 ? hiSince >= trig : loSince <= trig;   // false while NaN (no fill yet)
+				if (reached && tDir * (Closes[execIdx][0] - be) >= 2 * TickSize)
 				{
-					double be = avg + tDir * Instruments[execIdx].MasterInstrument.TickSize, cur;
+					double cur;
 					bool tighter;
 					lock (pxLock) tighter = !setStop.TryGetValue(Leg2, out cur) || tDir * (be - cur) > 0;
 					if (tighter) SetStop(Leg2, be);   // never loosens a stop you already tightened past BE
@@ -444,6 +510,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 			ApplyDrags();
 			ApplyTargetDrags();
+			GuardStops();
 			if (pendingClose)
 			{
 				pendingClose = false;
@@ -451,10 +518,45 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
+		// Every open leg must have a working stop. Missing for 2 s (e.g. cancelled in Chart Trader / DOM): put it back;
+		// still missing 2 s later: close that leg.
+		private void GuardStops()
+		{
+			if (!inTrade || pendingClose || Positions[execIdx].MarketPosition == MarketPosition.Flat) return;
+			List<string> legs;
+			lock (pxLock) legs = legQty.Where(kv => kv.Value > 0).Select(kv => kv.Key).ToList();
+			foreach (string leg in legs)
+			{
+				double want;
+				bool known;
+				DateTime since;
+				lock (pxLock)
+				{
+					if (stopPx.ContainsKey(leg)) { noStopSince.Remove(leg); continue; }
+					known = setStop.TryGetValue(leg, out want);
+					if (!noStopSince.TryGetValue(leg, out since)) { noStopSince[leg] = DateTime.Now; continue; }
+				}
+				double secs = (DateTime.Now - since).TotalSeconds;
+				if (secs < 2) continue;
+				if (secs < 4 && known)
+				{
+					SetStopLoss(leg, CalculationMode.Price, want, false);
+					statusMsg = leg + " had no stop: stop put back at " + want.ToString("0.00", CultureInfo.InvariantCulture);
+					continue;
+				}
+				int q;
+				lock (pxLock) { q = legQty[leg]; noStopSince[leg] = DateTime.Now; }
+				if (tDir > 0) ExitLong(execIdx, q, "NoStop", leg); else ExitShort(execIdx, q, "NoStop", leg);
+				statusMsg = leg + " still had no stop: leg closed";
+				panel.Announce("No stop on the trade. Leg closed.");
+			}
+		}
+
 		private void CloseTrade()
 		{
 			var trades = SystemPerformance.AllTrades.Where(t => t.Entry.Time >= tStartLocal.AddSeconds(-1)).ToList();
 			double pnl = trades.Sum(t => t.ProfitCurrency - t.Commission);
+			bool loss = trades.Sum(t => t.ProfitCurrency) < 0;   // before commission: a breakeven exit is not a loss
 			double qty = trades.Sum(t => (double)t.Quantity);
 			double exit = qty > 0 ? trades.Sum(t => t.Exit.Price * t.Quantity) / qty : Closes[execIdx][0];
 			double entry = !double.IsNaN(fillPx) ? fillPx : tEntry;
@@ -463,16 +565,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			tradesToday++;
 			pnlToday += pnl;
-			if (pnl < 0) { lossesToday++; lastLossDir = tDir; lastLossTime = DateTime.Now; }
+			if (loss) { lossesToday++; lastLossDir = tDir; lastLossTime = DateTime.Now; }
+			SaveDay();
 			string done = tradesToday >= MaxTradesPerDay ? tradesToday + " trades today." : lossesToday >= MaxLossesPerDay ? lossesToday + " losses today."
 				: DailyLossUsd > 0 && pnlToday <= -DailyLossUsd ? "Daily loss limit hit." : null;
 			if (done != null) panel.Announce(done + " Done for the day.");
-			else if (pnl < 0 && SameSideLockoutMin > 0) panel.Announce(string.Format("{0} side locked for {1} minutes.", tDir > 0 ? "Long" : "Short", SameSideLockoutMin));
+			else if (loss && SameSideLockoutMin > 0) panel.Announce(string.Format("{0} side locked for {1} minutes.", tDir > 0 ? "Long" : "Short", SameSideLockoutMin));
 			if (WriteJournal)
 				AppendJournal(entry, exit, pnl, r);
 			statusMsg = string.Format("closed {0}: {1}{2:N0} ({3:+0.00;-0.00}R), {4}", tDir > 0 ? "long" : "short", pnl >= 0 ? "+$" : "-$", Math.Abs(pnl), r, lastExitKind);
 			inTrade = false;
-			lock (pxLock) { stopPx.Clear(); tgtPx.Clear(); setStop.Clear(); dragged.Clear(); setTgt.Clear(); tdragged.Clear(); }
+			lock (pxLock) { stopPx.Clear(); tgtPx.Clear(); setStop.Clear(); dragged.Clear(); setTgt.Clear(); tdragged.Clear(); legQty.Clear(); noStopSince.Clear(); }
 			RemoveDrawObject("PE_entry"); RemoveDrawObject("PE_stop"); RemoveDrawObject("PE_tgt1"); RemoveDrawObject("PE_tgt2"); RemoveDrawObject("PE_lbl");
 		}
 		#endregion
@@ -516,10 +619,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 			Order o = execution.Order;
 			if (o == null || execution.Instrument != Instruments[execIdx]) return;
 			if ((o.Name == Leg1 || o.Name == Leg2) && double.IsNaN(fillPx)) fillPx = price;
+			lock (pxLock)
+			{
+				int q;
+				if (o.Name == Leg1 || o.Name == Leg2) { legQty.TryGetValue(o.Name, out q); legQty[o.Name] = q + quantity; }
+				else if (!string.IsNullOrEmpty(o.FromEntrySignal) && legQty.TryGetValue(o.FromEntrySignal, out q)) legQty[o.FromEntrySignal] = Math.Max(0, q - quantity);
+			}
 			if (o.Name == "Profit target" && o.FromEntrySignal == Leg1) { pendingBe = true; lastExitKind = "target"; }
 			else if (o.Name == "Profit target") lastExitKind = "target";
 			else if (o.Name == "Stop loss") lastExitKind = Math.Abs(price - (double.IsNaN(fillPx) ? price : fillPx)) <= 2 * TickSize ? "breakeven" : "stop";
 			else if (o.Name == "Flat") lastExitKind = "flat (manual)";
+			else if (o.Name == "NoStop") lastExitKind = "closed: no stop";
 			else if (o.Name == "Exit on session close") lastExitKind = "session close";
 		}
 
