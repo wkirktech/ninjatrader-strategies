@@ -5,6 +5,8 @@ Automated trading strategies for [NinjaTrader 8](https://ninjatrader.com/), writ
 | Strategy | What it does |
 |---|---|
 | [EmaRejectionExecution](Strategies/EmaRejectionExecution.cs) | Detects price rejecting (or bouncing off) an EMA with lower-high / higher-low structure, then works a limit order that rides the EMA, with an on-chart dashboard and an AUTO on/off switch. |
+| [DeltaConfluence](Indicators/DeltaConfluence.cs) (indicator) | Cumulative delta candles with EMAs, delta swing structure and price/delta divergence; optional per-bar CSV logger for offline backtests. |
+| [BarLogger](Indicators/BarLogger.cs) (indicator) | Writes every closed bar of a chart (OHLCV, US Eastern time) to one CSV, for long-history research such as daily-bias tests. |
 
 > **Disclaimer:** this is personal project code shared for educational and portfolio purposes. It is not financial advice. Futures trading carries substantial risk of loss. Test in a simulation account first.
 
@@ -37,8 +39,10 @@ Built for NQ / MNQ index futures on fast execution charts (377-tick, 1-min, 3-mi
 | **Entry** | Limit at EMA − offset (short) / EMA + offset (long). It is moved with the EMA every bar, and only placed while it can rest a minimum distance away from the market, so it never fills instantly. |
 | **Stop** | Fixed points from the fill (default 25). You can drag it tighter; if you drag it further away, it snaps back. |
 | **Target** | The setup's lower low (short) / higher high (long) plus a buffer, never closer than a minimum R-multiple (default 1:1). It extends with the leg until you drag it; wherever you drop it, it stays. |
-| **Profit lock** | At +30 pts the stop moves to +12 pts (both configurable). |
+| **Split targets** | Disabled for now: every NinjaTrader lock-up was a split trade. To be rebuilt as one entry with a strategy-managed partial exit. With 2+ contracts: two entry limits at the same price. Half exits at TP1 (default 1R), the runner at the leg target; both share the locked stop, and the runner's stop moves to breakeven after TP1 (optional). Each TP can be dragged on its own. |
+| **Profit lock** | Off by default. When on, at +30 pts the stop moves to +12 pts (both configurable). |
 | **Automation** | Stays armed and takes every new setup until a full stop-loss hit (configurable), or until you switch it off. |
+| **Day limits** | Optional daily stop ($), max losing trades and max trades. A trade is only taken if its full stop keeps the day inside the daily stop; once a limit is hit, AUTO turns off for the day. |
 
 ### Dashboard
 
@@ -56,7 +60,7 @@ The buttons are:
 - **FLAT+OFF**: cancels the order, closes the position and turns AUTO off
 - **BUY @EMA / SELL @EMA**: forces a setup on that side
 
-Every event (orders, fills, drags, chop, auto on/off) is also written to `Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt`, so a session can be reviewed after a restart.
+Every event (orders, fills, drags, chop, auto on/off) is also written to `Documents\NinjaTrader 8\log\EmaRejection.yyyyMMdd.txt`, so a session can be reviewed after a restart. Each closed trade is added to `Documents\NinjaTrader 8\analysis\trades.csv` (size, entry, stop, target, exit, P&L, R, MAE/MFE), and `analysis\levels.txt` holds the current levels (prior session, overnight, VWAP, trend, chop) for the agents.
 
 ### Design notes
 
@@ -80,6 +84,38 @@ Every event (orders, fills, drags, chop, auto on/off) is also written to `Docume
 4. **Live Sim101** before any funded account.
 
 ---
+
+## DeltaConfluence (indicator)
+
+Cumulative delta (volume traded at the ask minus volume at the bid), drawn as candles in a panel under price. History comes from a 1-tick series it loads itself, with the bid/ask stored for every trade (same method as the CumDelta indicator), or from Tick Replay (bid/ask for every trade) via *Delta source*.
+
+- **EMAs** 21 / 55 on the delta close.
+- **Delta swings:** confirmed after a reversal of *N* x the average delta bar range. Green dot = delta higher low, red = lower high.
+- **Divergence:** price makes an equal or lower swing low (swing size = a share of the session VWAP SD) while delta's low there is higher. Cyan triangle; magenta for the bearish mirror.
+- **Flags for strategies** (set on bar close, +1 / -1 / 0): `EmaState`, `HlState`, `Divergence`, `PriceHlState` (price higher low / lower high, same swing method) and `DeltaVsEma` (delta above / below its fast EMA).
+- **Logger** (off by default): one CSV per day in `Documents\NinjaTrader 8\analysis\bars\` with OHLCV, session VWAP and SD, EMA, delta OHLC, the delta EMAs and the flags. Only sessions that start while loaded are written; reloading the chart rewrites a day instead of duplicating it.
+
+The flags are logged first and are not filters: they become one only if the data shows they help.
+
+## BarLogger (indicator)
+
+Writes every closed bar of the chart's series to `Documents\NinjaTrader 8\analysis\history\<instrument>_<bar type>.csv` (e.g. `NQ_1Minute.csv`, `NQ_1Day.csv`) with columns `date_et,time_et,open,high,low,close,volume`. Intraday times are bar close times in US Eastern (DST handled); daily bars keep their session date and leave the time blank. Each load replaces the file.
+
+- Use the continuous contract `NQ ##-##` with *Merge policy: Merge back adjusted* (Tools > Options > Market data), or every roll shows up as a fake gap.
+- Set *Days to load* on the data series to the history wanted (e.g. 10 years daily, 3 years 1-minute). The output window prints the bar count and date range once loading finishes.
+
+## Agents
+
+`.claude/agents/` holds Claude Code agents for this repo: code-reviewer, debugger, strategy-analyst, risk-manager and market-regime. They share the facts in [docs/trading-context.md](docs/trading-context.md). Code makes every live trading decision; the agents work offline.
+
+`tools/run-agent.ps1` runs a scheduled job headless and saves the result to `Documents\NinjaTrader 8\analysis\briefs\`:
+- **premarket** (weekdays): levels, news and regime brief
+- **review** (weekdays, after the close): session review and one lesson
+- **weekly** (Saturday): roll-up with at most one proposed change
+
+Register them in Windows Task Scheduler with `tools/register-agent-tasks.ps1` (`-Remove` to delete). They run only while you are logged on, with read-only tools: no job can write, edit or run code. The script passes files in and appends the review's lesson itself.
+
+The same script also schedules `tools/context_sheet.py` (plain Python, no agent) at 6:25 and 7:31 PT on weekdays. It reads BarLogger's NQ 1-minute export and writes `briefs\<date>-context.md`: prior-day and overnight levels, the initial balance, and the market profile hit rates that held up on 2021-2026 data, with a long/short/no lean. Context only: as stand-alone entries these stats did not beat costs. Needs NinjaTrader open with BarLogger on the 1-min NQ chart; `--at "YYYY-MM-DD HH:MM"` replays a past morning.
 
 ## Development workflow
 
