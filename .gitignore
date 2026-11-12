@@ -14,7 +14,6 @@
 !/Strategies/
 /Strategies/*
 !/Strategies/EmaRejectionExecution.cs
-!/Strategies/PlaybookExecutor.cs
 
 !/Indicators/
 /Indicators/*
@@ -24,5 +23,4 @@
 !/Indicators/AutoCenterPrice.cs
 !/Indicators/BigTrades.cs
 !/Indicators/PMARPv3.cs
-!/Indicators/TradePlanPanel.cs
 !/Indicators/HourWickLevels.cs
