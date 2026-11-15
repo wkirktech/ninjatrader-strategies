@@ -496,6 +496,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush dxBandIb;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandHigh;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandLow;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandVolPoc;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandVolVa;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandSingle;
 		private bool drawingBanded;
 		private static readonly int[] BandLevels = { LvPoc, LvVah, LvVal };
@@ -515,6 +517,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private const int BandIb = 3;
 		private const int BandHigh = 4;
 		private const int BandLow = 5;
+		private const int BandVolPoc = 6;
+		private const int BandVolVa = 7;
+
+		// 5-min bars {high, low, close, closed} of the newest RTH session from its open (render thread), for SweepTag
+		private List<double[]> sweepBars;
+		private double sweepOpen;
 		private volatile List<BandLevel> bandWanted;
 		private volatile HashSet<string> bandShown = new HashSet<string>();   // drawn as global lines (copy-on-write, read while rendering)
 		private List<BandLevel> bandSent;
@@ -627,7 +635,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				PriorSessionLevels = false;
 				NakedPocExtend = true;
 				PriorHighlight = true;
-				PriorHighlightSessions = 2;
+				PriorHighlightSessions = 5;
 				PriorHighlightWidth = 10;
 				PriorHighlightOpacity = 50;
 				PriorHighlightVaBrush = Brushes.CornflowerBlue;
@@ -637,6 +645,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				HighlightToday = true;
 				HighlightIb = true;
 				HighlightRange = true;
+				HighlightVolume = true;
 				PriorHighlightSingleBrush = Brushes.Magenta;
 
 				// 3b. ETH profile levels (with Add ETH Profiles)
@@ -3183,6 +3192,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			dxBandIb = MakeBrush(InitialBalanceBrush, bandOpacity);
 			dxBandHigh = MakeBrush(PriorHighBrush, bandOpacity);
 			dxBandLow = MakeBrush(PriorLowBrush, bandOpacity);
+			dxBandVolPoc = MakeBrush(VolumePocBrush, bandOpacity);
+			dxBandVolVa = MakeBrush(VolumeVahBrush, bandOpacity);
 			dxDayType = MakeBrush(DayTypeBrush, 1f);
 			dxOpenType = MakeBrush(OpenTypeBrush, 1f);
 			dxStatsBack = MakeBrush(StatisticsBackgroundBrush, 0.75f);
@@ -3275,6 +3286,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DisposeBrush(ref dxBandIb);
 			DisposeBrush(ref dxBandHigh);
 			DisposeBrush(ref dxBandLow);
+			DisposeBrush(ref dxBandVolPoc);
+			DisposeBrush(ref dxBandVolVa);
 			DisposeBrush(ref dxBandSingle);
 			DisposeBrush(ref dxDayType);
 			DisposeBrush(ref dxOpenType);
@@ -3842,6 +3855,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (!dxReady || !object.ReferenceEquals(dxTarget, RenderTarget))
 				CreateDeviceResources();
 
+			BuildSweepBars(snapshot, barCount);
+
 			for (int i = 0; i < snapshot.Length; i++)
 			{
 				TpoProfile p = snapshot[i];
@@ -3933,7 +3948,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 							HLine(xStart, clipRight, y, lv == LvPoc ? dxBandPoc : dxBandVa, Math.Max(1, PriorHighlightWidth), null);
 						// An untouched naked level is labelled at the right edge by the naked pass
 						if (!NakedOpen(p, b, lv))
-							DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
+							DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
 					}
 
 					// Single prints: one band through the middle of each run of single-print rows inside the profile
@@ -3959,13 +3974,39 @@ namespace NinjaTrader.NinjaScript.Indicators
 								HLine(xStart, clipRight, chartScale.GetYByValue(mid), dxBandSingle, Math.Max(1, PriorHighlightWidth), null);
 						}
 					}
+
+					// Range high / low and the volume profile's POC / VAH / VAL of the same sessions
+					List<BandLevel> more = new List<BandLevel>();
+					string key = p.Sessions.Count > 0 ? "TPOband_" + p.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) : null;
+					if (key != null && HighlightRange)
+					{
+						more.Add(new BandLevel { Tag = key + "_High", Price = b.High, Kind = BandHigh });
+						more.Add(new BandLevel { Tag = key + "_Low", Price = b.Low, Kind = BandLow });
+					}
+					if (key != null && HighlightVolume && b.Vol != null && b.MaxVol > 0)
+						foreach (int lv in new[] { LvVolPoc, LvVolVah, LvVolVal })
+						{
+							double volLine, volPrice;
+							if (LevelValues(b, lv, out volLine, out volPrice))
+								more.Add(new BandLevel { Tag = key + "_" + LevelName(lv), Price = volLine, Kind = lv == LvVolPoc ? BandVolPoc : BandVolVa, Thin = true });
+						}
+					foreach (BandLevel l in more)
+					{
+						if (wanted != null)
+						{
+							l.Tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + l.Tag;
+							wanted.Add(l);
+							if (bandShown.Contains(l.Tag))
+								continue;
+						}
+						if (xStart < clipRight)
+							HLine(xStart, clipRight, chartScale.GetYByValue(l.Price), BandDx(l.Kind), BandWidth(l), null);
+					}
 				}
 				// Today's levels as thinner bands in the same colours, the initial balance, and today's and the prior session's range
 				List<BandLevel> extra = new List<BandLevel>();
 				TpoProfile cur = curIdx >= 0 ? snapshot[curIdx] : null;
-				TpoProfile prev = prevIdx >= 0 ? snapshot[prevIdx] : null;
 				string curKey = cur != null && cur.Sessions.Count > 0 ? "TPOband_" + cur.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) : null;
-				string prevKey = prev != null && prev.Sessions.Count > 0 ? "TPOband_" + prev.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) : null;
 				double lineAt, priceAt;
 				if (curKey != null && cur.Built != null && cur.Built.RowCount > 0)
 				{
@@ -3984,13 +4025,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						extra.Add(new BandLevel { Tag = curKey + "_IBL", Price = ibBottom, Kind = BandIb, Thin = true });
 					}
 				}
-				if (HighlightRange && prevKey != null && prev.Built != null && prev.Built.RowCount > 0)
-				{
-					extra.Add(new BandLevel { Tag = prevKey + "_High", Price = prev.Built.High, Kind = BandHigh });
-					extra.Add(new BandLevel { Tag = prevKey + "_Low", Price = prev.Built.Low, Kind = BandLow });
-				}
 				float xToday = cur != null ? Math.Max(clipLeft, XOfIndex(chartControl, cur.GeoStart, lastIdx, barDistance) - barDistance * 0.5f) : clipLeft;
-				float xPrev = prev != null ? Math.Max(clipLeft, XOfIndex(chartControl, prev.GeoStart, lastIdx, barDistance) - barDistance * 0.5f) : clipLeft;
 				foreach (BandLevel l in extra)
 				{
 					if (wanted != null)
@@ -4000,9 +4035,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 						if (bandShown.Contains(l.Tag))
 							continue;
 					}
-					float x0 = l.Thin ? xToday : xPrev;
-					if (x0 < clipRight)
-						HLine(x0, clipRight, chartScale.GetYByValue(l.Price), BandDx(l.Kind), BandWidth(l), null);
+					if (xToday < clipRight)
+						HLine(xToday, clipRight, chartScale.GetYByValue(l.Price), BandDx(l.Kind), BandWidth(l), null);
 				}
 
 				if (wanted != null && !SameBands(wanted, bandWanted))
@@ -4283,6 +4317,70 @@ namespace NinjaTrader.NinjaScript.Indicators
 			});
 		}
 
+		// Groups the chart bars of the newest RTH session (from its open) into 5-min bars for SweepTag.
+		private void BuildSweepBars(TpoProfile[] snapshot, int barCount)
+		{
+			sweepBars = null;
+			TpoProfile cur = null;
+			for (int i = 0; i < snapshot.Length && i < nextSameBuffer.Length; i++)
+				if (!EthSet(snapshot[i]) && nextSameBuffer[i] < 0)
+					cur = snapshot[i];
+			if (cur == null || cur.Sessions.Count == 0 || barCount == 0)
+				return;
+			TpoSession s = cur.Sessions[cur.Sessions.Count - 1];
+			if (s.FirstBarOpen == DateTime.MinValue)
+				return;
+			Bars series = ChartSeries();
+			List<double[]> list = new List<double[]>();
+			long key = -1;
+			double h = 0, l = 0, c = 0;
+			for (int i = FirstBarAfter(s.FirstBarOpen, barCount); i < barCount; i++)
+			{
+				long k = series.GetTime(i).AddTicks(-1).Ticks / TimeSpan.FromMinutes(5).Ticks;
+				if (k != key)
+				{
+					if (key >= 0)
+						list.Add(new[] { h, l, c, 1 });
+					key = k;
+					h = series.GetHigh(i);
+					l = series.GetLow(i);
+				}
+				h = Math.Max(h, series.GetHigh(i));
+				l = Math.Min(l, series.GetLow(i));
+				c = series.GetClose(i);
+			}
+			if (key >= 0)
+				list.Add(new[] { h, l, c, 0 });
+			sweepOpen = s.Open;
+			sweepBars = list;
+		}
+
+		// " (swept)" once the newest RTH session traded through the level from the side it opened on,
+		// " (swept, reclaimed)" after a 5-min close back on that side; empty when not swept.
+		private string SweepTag(double level)
+		{
+			List<double[]> bars = sweepBars;
+			if (bars == null || bars.Count == 0)
+				return string.Empty;
+			int side = sweepOpen >= level ? 1 : -1;
+			int state = 0;
+			foreach (double[] bar in bars)
+			{
+				bool through = side > 0 ? bar[1] < level - tickSize : bar[0] > level + tickSize;
+				if (through)
+					state = 1;
+				if (state > 0 && bar[3] > 0)
+				{
+					bool back = side > 0 ? bar[2] >= level : bar[2] <= level;
+					if (back)
+						state = 2;
+					else if (through)
+						state = 1;
+				}
+			}
+			return state == 1 ? " (swept)" : state == 2 ? " (swept, reclaimed)" : string.Empty;
+		}
+
 		private Brush BandBrush(int kind)
 		{
 			switch (kind)
@@ -4292,6 +4390,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				case BandIb: return InitialBalanceBrush;
 				case BandHigh: return PriorHighBrush;
 				case BandLow: return PriorLowBrush;
+				case BandVolPoc: return VolumePocBrush;
+				case BandVolVa: return VolumeVahBrush;
 				default: return PriorHighlightVaBrush;
 			}
 		}
@@ -4305,6 +4405,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				case BandIb: return dxBandIb;
 				case BandHigh: return dxBandHigh;
 				case BandLow: return dxBandLow;
+				case BandVolPoc: return dxBandVolPoc;
+				case BandVolVa: return dxBandVolVa;
 				default: return dxBandVa;
 			}
 		}
@@ -4660,7 +4762,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				// An untouched prior POC is labelled once, as "nPOC" at the right edge, by the naked pass.
 				if (carried && !(lv == LvPoc && NakedPocOpen(p, b)))
-					DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
+					DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
 
 				if (isLatest && shown && LevelScale(lv, ethLevels))
 					DrawScaleTag(lv, price, y);
@@ -5374,8 +5476,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Highlight Initial Balance", Description = "Also band the initial balance high and low (Initial Balance colour), half the width. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 36)]
 		public bool HighlightIb { get; set; }
 
-		[Display(Name = "Highlight Session High / Low", Description = "Also band the newest session's high and low (half the width) and the prior session's high and low, in the Prior High / Prior Low colours. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 37)]
+		[Display(Name = "Highlight Session High / Low", Description = "Also band the newest session's high and low (half the width) and the high and low of every highlighted session, in the Prior High / Prior Low colours. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 37)]
 		public bool HighlightRange { get; set; }
+
+		[Display(Name = "Highlight Volume Levels", Description = "Also band the volume profile's POC / VAH / VAL of the highlighted sessions (Volume POC / VAH colours), half the width. Needs the volume profile and Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 38)]
+		public bool HighlightVolume { get; set; }
 
 		#endregion
 
