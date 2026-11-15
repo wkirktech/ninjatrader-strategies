@@ -4040,7 +4040,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 
 				if (wanted != null && !SameBands(wanted, bandWanted))
+				{
 					bandWanted = wanted;
+					// Draw the global lines now, not on the next bar: none come while the market or Playback is paused
+					ChartControl cc = ChartControl;
+					if (cc != null)
+						cc.Dispatcher.InvokeAsync(() => { try { TriggerCustomEvent(o => SyncGlobalBands(), null); } catch { } });
+				}
 			}
 
 			// Naked levels run from the end of their profile to the bar that traded them again, or to the right edge.
@@ -4355,30 +4361,60 @@ namespace NinjaTrader.NinjaScript.Indicators
 			sweepBars = list;
 		}
 
-		// " (swept)" once the newest RTH session traded through the level from the side it opened on,
-		// " (swept, reclaimed)" after a 5-min close back on that side; empty when not swept.
+		// How the newest RTH session (5-min bars from its open) treated a level, following the side price is on:
+		// " (swept)": traded through, no 5-min close back yet. " (swept, reclaimed)": then a 5-min close back.
+		// " (broken)": 2 five-minute closes in a row beyond it, so price now lives on the other side.
+		// " (broken, rejected)": after a break, price came back to it (within 1 pt) and closed away again.
 		private string SweepTag(double level)
 		{
 			List<double[]> bars = sweepBars;
 			if (bars == null || bars.Count == 0)
 				return string.Empty;
-			int side = sweepOpen >= level ? 1 : -1;
-			int state = 0;
+			int side = sweepOpen >= level ? 1 : -1;   // 1: price is above the level, -1: below
+			int state = 0;                            // 0 none, 1 swept, 2 reclaimed, 3 broken, 4 broken and rejected
+			int beyond = 0;
+			bool broken = false;
+			bool retest = false;
 			foreach (double[] bar in bars)
 			{
 				bool through = side > 0 ? bar[1] < level - tickSize : bar[0] > level + tickSize;
+				bool touch = side > 0 ? bar[1] <= level + 1 : bar[0] >= level - 1;
 				if (through)
 					state = 1;
-				if (state > 0 && bar[3] > 0)
+				if (broken && touch)
+					retest = true;
+				if (bar[3] <= 0)
+					continue;   // the forming bar only sweeps, it does not close
+				bool closeBeyond = side > 0 ? bar[2] < level : bar[2] > level;
+				if (closeBeyond)
 				{
-					bool back = side > 0 ? bar[2] >= level : bar[2] <= level;
-					if (back)
-						state = 2;
-					else if (through)
-						state = 1;
+					if (++beyond >= 2)
+					{
+						side = -side;
+						state = 3;
+						broken = true;
+						retest = false;
+						beyond = 0;
+					}
+				}
+				else
+				{
+					beyond = 0;
+					if (state == 1)
+						state = broken ? 4 : 2;
+					else if (state == 3 && retest)
+						state = 4;
+					retest = false;
 				}
 			}
-			return state == 1 ? " (swept)" : state == 2 ? " (swept, reclaimed)" : string.Empty;
+			switch (state)
+			{
+				case 1: return " (swept)";
+				case 2: return " (swept, reclaimed)";
+				case 3: return " (broken)";
+				case 4: return " (broken, rejected)";
+				default: return string.Empty;
+			}
 		}
 
 		private Brush BandBrush(int kind)
