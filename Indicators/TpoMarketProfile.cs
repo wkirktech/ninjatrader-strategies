@@ -99,6 +99,33 @@ namespace TpoMarketProfileTypes
 		Right,
 		OverTpo
 	}
+
+	// The newest RTH profile's levels, for other NinjaScript on the same instrument (written while the chart renders).
+	// Names: VAH / POC / VAL / High / Low of the current (newest) profile, pVAH / pPOC / pVAL / pHigh / pLow of the one
+	// before it, SP for the middle of each single print run of the one before, IBH / IBL once the initial balance is done.
+	public sealed class TpoLevelSet
+	{
+		public DateTime At;              // local clock when written
+		public DateTime CurrentDate;     // session date of the newest RTH profile
+		public KeyValuePair<string, double>[] Levels;
+	}
+
+	public static class TpoLevelFeed
+	{
+		private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TpoLevelSet> sets =
+			new System.Collections.Concurrent.ConcurrentDictionary<string, TpoLevelSet>();
+
+		public static void Publish(string instrument, TpoLevelSet set) { sets[instrument] = set; }
+
+		// null when no TPO chart of this instrument has drawn in maxAgeSec
+		public static TpoLevelSet Get(string instrument, int maxAgeSec)
+		{
+			TpoLevelSet s;
+			if (instrument == null || !sets.TryGetValue(instrument, out s) || (DateTime.Now - s.At).TotalSeconds > maxAgeSec)
+				return null;
+			return s;
+		}
+	}
 }
 
 namespace NinjaTrader.NinjaScript.Indicators
@@ -466,6 +493,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush dxGapArea;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandVa;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandPoc;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandIb;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandHigh;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandLow;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandVolPoc;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandVolVa;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandSingle;
 		private bool drawingBanded;
 		private static readonly int[] BandLevels = { LvPoc, LvVah, LvVal };
@@ -476,11 +508,25 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			public string Tag;
 			public double Price;
-			public int Kind;   // BandPoc, BandVa or BandSingle
+			public int Kind;   // BandPoc, BandVa, BandSingle, BandIb, BandHigh or BandLow
+			public bool Thin;  // today's developing levels: half the width
 		}
 		private const int BandPoc = 0;
 		private const int BandVa = 1;
 		private const int BandSingle = 2;
+		private const int BandIb = 3;
+		private const int BandHigh = 4;
+		private const int BandLow = 5;
+		private const int BandVolPoc = 6;
+		private const int BandVolVa = 7;
+
+		// 5-min bars {high, low, close, closed} of the newest RTH session from its open (render thread), for SweepTag
+		private List<double[]> sweepBars;
+		private DateTime bandCheckAt = DateTime.MinValue;
+		// touch odds (render thread): level (in ticks) -> % chance a random walk at the last hour's volatility touches it
+		// within TouchMinutes; only the nearest 2 labelled levels above and below price get one
+		private Dictionary<long, double> touchOdds = new Dictionary<long, double>();
+		private double sweepOpen;
 		private volatile List<BandLevel> bandWanted;
 		private volatile HashSet<string> bandShown = new HashSet<string>();   // drawn as global lines (copy-on-write, read while rendering)
 		private List<BandLevel> bandSent;
@@ -593,13 +639,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 				PriorSessionLevels = false;
 				NakedPocExtend = true;
 				PriorHighlight = true;
-				PriorHighlightSessions = 2;
+				PriorHighlightSessions = 5;
 				PriorHighlightWidth = 10;
 				PriorHighlightOpacity = 50;
 				PriorHighlightVaBrush = Brushes.CornflowerBlue;
 				PriorHighlightPocBrush = Brushes.Yellow;
 				PriorHighlightGlobal = true;
 				PriorHighlightSingles = true;
+				HighlightToday = true;
+				HighlightIb = true;
+				HighlightRange = true;
+				HighlightVolume = true;
+				ShowTouchOdds = false;
+				TouchMinutes = 30;
 				PriorHighlightSingleBrush = Brushes.Magenta;
 
 				// 3b. ETH profile levels (with Add ETH Profiles)
@@ -3143,6 +3195,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			dxBandVa = MakeBrush(PriorHighlightVaBrush, bandOpacity);
 			dxBandPoc = MakeBrush(PriorHighlightPocBrush, bandOpacity);
 			dxBandSingle = MakeBrush(PriorHighlightSingleBrush, bandOpacity);
+			dxBandIb = MakeBrush(InitialBalanceBrush, bandOpacity);
+			dxBandHigh = MakeBrush(PriorHighBrush, bandOpacity);
+			dxBandLow = MakeBrush(PriorLowBrush, bandOpacity);
+			dxBandVolPoc = MakeBrush(VolumePocBrush, bandOpacity);
+			dxBandVolVa = MakeBrush(VolumeVahBrush, bandOpacity);
 			dxDayType = MakeBrush(DayTypeBrush, 1f);
 			dxOpenType = MakeBrush(OpenTypeBrush, 1f);
 			dxStatsBack = MakeBrush(StatisticsBackgroundBrush, 0.75f);
@@ -3232,6 +3289,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DisposeBrush(ref dxGapArea);
 			DisposeBrush(ref dxBandVa);
 			DisposeBrush(ref dxBandPoc);
+			DisposeBrush(ref dxBandIb);
+			DisposeBrush(ref dxBandHigh);
+			DisposeBrush(ref dxBandLow);
+			DisposeBrush(ref dxBandVolPoc);
+			DisposeBrush(ref dxBandVolVa);
 			DisposeBrush(ref dxBandSingle);
 			DisposeBrush(ref dxDayType);
 			DisposeBrush(ref dxOpenType);
@@ -3799,6 +3861,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (!dxReady || !object.ReferenceEquals(dxTarget, RenderTarget))
 				CreateDeviceResources();
 
+			BuildSweepBars(snapshot, barCount);
+			BuildTouchOdds(snapshot, barCount);
+
 			for (int i = 0; i < snapshot.Length; i++)
 			{
 				TpoProfile p = snapshot[i];
@@ -3835,6 +3900,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 				DrawProfile(chartControl, chartScale, p, b, nextSameBuffer[i] < 0, xLeft, xRight, xPriorEnd, hasNext, levelsOnly, barCount, lastIdx, barDistance);
 			}
 			drawingBanded = false;
+
+			// The newest RTH profile (today, or the last session while the market is closed) and the one before it
+			int curIdx = -1, prevIdx = -1;
+			for (int i = 0; i < snapshot.Length; i++)
+				if (!EthSet(snapshot[i]) && nextSameBuffer[i] < 0)
+					curIdx = i;
+			for (int i = 0; i < snapshot.Length && curIdx >= 0; i++)
+				if (nextSameBuffer[i] == curIdx && !EthSet(snapshot[i]))
+					prevIdx = i;
+			PublishLevels(snapshot, curIdx, prevIdx, ibReady, ibTop, ibBottom);
 
 			// "Highlight Prior Levels": the chosen POC / VAH / VAL of the last few sessions before the current one,
 			// as wide see-through bands from their own profile to the right edge.
@@ -3880,7 +3955,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 							HLine(xStart, clipRight, y, lv == LvPoc ? dxBandPoc : dxBandVa, Math.Max(1, PriorHighlightWidth), null);
 						// An untouched naked level is labelled at the right edge by the naked pass
 						if (!NakedOpen(p, b, lv))
-							DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
+							DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price) + TouchTag(price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
 					}
 
 					// Single prints: one band through the middle of each run of single-print rows inside the profile
@@ -3904,11 +3979,89 @@ namespace NinjaTrader.NinjaScript.Indicators
 							}
 							if (xStart < clipRight && (tag == null || !bandShown.Contains(tag)))
 								HLine(xStart, clipRight, chartScale.GetYByValue(mid), dxBandSingle, Math.Max(1, PriorHighlightWidth), null);
+							// a single print within reach gets a label with its touch odds
+							string odds = TouchTag(mid);
+							if (odds.Length > 0 && xStart < clipRight)
+								DrawLabel(PriorText("SP", mid, ProfileIsEth(p)) + SweepTag(mid) + odds, clipRight - 4f, chartScale.GetYByValue(mid), dxText, true, -1, labelFormat);
 						}
 					}
+
+					// Range high / low and the volume profile's POC / VAH / VAL of the same sessions
+					List<BandLevel> more = new List<BandLevel>();
+					string key = p.Sessions.Count > 0 ? "TPOband_" + p.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) : null;
+					if (key != null && HighlightRange)
+					{
+						more.Add(new BandLevel { Tag = key + "_High", Price = b.High, Kind = BandHigh });
+						more.Add(new BandLevel { Tag = key + "_Low", Price = b.Low, Kind = BandLow });
+					}
+					if (key != null && HighlightVolume && b.Vol != null && b.MaxVol > 0)
+						foreach (int lv in new[] { LvVolPoc, LvVolVah, LvVolVal })
+						{
+							double volLine, volPrice;
+							if (LevelValues(b, lv, out volLine, out volPrice))
+								more.Add(new BandLevel { Tag = key + "_" + LevelName(lv), Price = volLine, Kind = lv == LvVolPoc ? BandVolPoc : BandVolVa, Thin = true });
+						}
+					foreach (BandLevel l in more)
+					{
+						if (wanted != null)
+						{
+							l.Tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + l.Tag;
+							wanted.Add(l);
+							if (bandShown.Contains(l.Tag))
+								continue;
+						}
+						if (xStart < clipRight)
+							HLine(xStart, clipRight, chartScale.GetYByValue(l.Price), BandDx(l.Kind), BandWidth(l), null);
+					}
 				}
-				if (wanted != null && !SameBands(wanted, bandWanted))
+				// Today's levels as thinner bands in the same colours, the initial balance, and today's and the prior session's range
+				List<BandLevel> extra = new List<BandLevel>();
+				TpoProfile cur = curIdx >= 0 ? snapshot[curIdx] : null;
+				string curKey = cur != null && cur.Sessions.Count > 0 ? "TPOband_" + cur.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) : null;
+				double lineAt, priceAt;
+				if (curKey != null && cur.Built != null && cur.Built.RowCount > 0)
+				{
+					if (HighlightToday)
+						foreach (int lv in BandLevels)
+							if (PriorChosen(lv, false) && LevelValues(cur.Built, lv, out lineAt, out priceAt))
+								extra.Add(new BandLevel { Tag = curKey + "_today" + LevelName(lv), Price = lineAt, Kind = lv == LvPoc ? BandPoc : BandVa, Thin = true });
+					if (HighlightRange)
+					{
+						extra.Add(new BandLevel { Tag = curKey + "_todayHigh", Price = cur.Built.High, Kind = BandHigh, Thin = true });
+						extra.Add(new BandLevel { Tag = curKey + "_todayLow", Price = cur.Built.Low, Kind = BandLow, Thin = true });
+					}
+					if (HighlightIb && ibReady)
+					{
+						extra.Add(new BandLevel { Tag = curKey + "_IBH", Price = ibTop, Kind = BandIb, Thin = true });
+						extra.Add(new BandLevel { Tag = curKey + "_IBL", Price = ibBottom, Kind = BandIb, Thin = true });
+					}
+				}
+				float xToday = cur != null ? Math.Max(clipLeft, XOfIndex(chartControl, cur.GeoStart, lastIdx, barDistance) - barDistance * 0.5f) : clipLeft;
+				foreach (BandLevel l in extra)
+				{
+					if (wanted != null)
+					{
+						l.Tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + l.Tag;
+						wanted.Add(l);
+						if (bandShown.Contains(l.Tag))
+							continue;
+					}
+					if (xToday < clipRight)
+						HLine(xToday, clipRight, chartScale.GetYByValue(l.Price), BandDx(l.Kind), BandWidth(l), null);
+				}
+
+				// Draw the global lines now, not on the next bar (none come while the market or Playback is paused), and every
+				// few seconds put back any that were removed (Remove All Drawing Objects, another chart's copy of the indicator)
+				bool changed = wanted != null && !SameBands(wanted, bandWanted);
+				if (changed)
 					bandWanted = wanted;
+				if (wanted != null && (changed || (DateTime.Now - bandCheckAt).TotalSeconds >= 3))
+				{
+					bandCheckAt = DateTime.Now;
+					ChartControl cc = ChartControl;
+					if (cc != null)
+						cc.Dispatcher.InvokeAsync(() => { try { TriggerCustomEvent(o => SyncGlobalBands(true), null); } catch { } });
+				}
 			}
 
 			// Naked levels run from the end of their profile to the bar that traded them again, or to the right edge.
@@ -4138,6 +4291,278 @@ namespace NinjaTrader.NinjaScript.Indicators
 			return PriorSessionLevels || nextSameBuffer[next] < 0;
 		}
 
+		// Shares the newest RTH profile's levels with other NinjaScript on this instrument (TradePlanPanel): TpoLevelFeed
+		private void PublishLevels(TpoProfile[] snapshot, int curIdx, int prevIdx, bool ibReady, double ibTop, double ibBottom)
+		{
+			if (curIdx < 0 || Instrument == null)
+				return;
+			TpoProfile cur = snapshot[curIdx];
+			if (cur.Built == null || cur.Built.RowCount == 0 || cur.Sessions.Count == 0)
+				return;
+			List<KeyValuePair<string, double>> levels = new List<KeyValuePair<string, double>>();
+			Action<string, TpoBuilt> add = (prefix, b) =>
+			{
+				double lineAt, priceAt;
+				foreach (int lv in new[] { LvVah, LvPoc, LvVal })
+					if (LevelValues(b, lv, out lineAt, out priceAt))
+						levels.Add(new KeyValuePair<string, double>(prefix + LevelName(lv), priceAt));
+				levels.Add(new KeyValuePair<string, double>(prefix + "High", b.High));
+				levels.Add(new KeyValuePair<string, double>(prefix + "Low", b.Low));
+			};
+			add("", cur.Built);
+			TpoBuilt pb = prevIdx >= 0 ? snapshot[prevIdx].Built : null;
+			if (pb != null && pb.RowCount > 0)
+			{
+				add("p", pb);
+				int n = pb.RowCount;
+				for (int r = Math.Max(0, pb.BottomRun); r < n - pb.TopRun; r++)
+				{
+					if (pb.Counts[r] != 1)
+						continue;
+					int first = r;
+					while (r + 1 < n - pb.TopRun && pb.Counts[r + 1] == 1)
+						r++;
+					levels.Add(new KeyValuePair<string, double>("SP", (RowBottomPrice(pb, first) + RowTopPrice(pb, r)) / 2));
+				}
+			}
+			if (ibReady)
+			{
+				levels.Add(new KeyValuePair<string, double>("IBH", ibTop));
+				levels.Add(new KeyValuePair<string, double>("IBL", ibBottom));
+			}
+			TpoMarketProfileTypes.TpoLevelFeed.Publish(Instrument.FullName, new TpoMarketProfileTypes.TpoLevelSet
+			{
+				At = DateTime.Now,
+				CurrentDate = cur.Sessions[cur.Sessions.Count - 1].PeriodDate,
+				Levels = levels.ToArray()
+			});
+		}
+
+		// Groups the chart bars of the newest RTH session (from its open) into 5-min bars for SweepTag.
+		private void BuildSweepBars(TpoProfile[] snapshot, int barCount)
+		{
+			sweepBars = null;
+			TpoProfile cur = null;
+			for (int i = 0; i < snapshot.Length && i < nextSameBuffer.Length; i++)
+				if (!EthSet(snapshot[i]) && nextSameBuffer[i] < 0)
+					cur = snapshot[i];
+			if (cur == null || cur.Sessions.Count == 0 || barCount == 0)
+				return;
+			TpoSession s = cur.Sessions[cur.Sessions.Count - 1];
+			if (s.FirstBarOpen == DateTime.MinValue)
+				return;
+			Bars series = ChartSeries();
+			List<double[]> list = new List<double[]>();
+			long key = -1;
+			double h = 0, l = 0, c = 0;
+			for (int i = FirstBarAfter(s.FirstBarOpen, barCount); i < barCount; i++)
+			{
+				long k = series.GetTime(i).AddTicks(-1).Ticks / TimeSpan.FromMinutes(5).Ticks;
+				if (k != key)
+				{
+					if (key >= 0)
+						list.Add(new[] { h, l, c, 1 });
+					key = k;
+					h = series.GetHigh(i);
+					l = series.GetLow(i);
+				}
+				h = Math.Max(h, series.GetHigh(i));
+				l = Math.Min(l, series.GetLow(i));
+				c = series.GetClose(i);
+			}
+			if (key >= 0)
+				list.Add(new[] { h, l, c, 0 });
+			sweepOpen = s.Open;
+			sweepBars = list;
+		}
+
+		// How the newest RTH session (5-min bars from its open) treated a level, following the side price is on:
+		// " (swept)": traded through, no 5-min close back yet. " (swept, reclaimed)": then a 5-min close back.
+		// " (broken)": 2 five-minute closes in a row beyond it, so price now lives on the other side.
+		// " (broken, rejected)": after a break, price came back to it (within 1 pt) and closed away again.
+		private string SweepTag(double level)
+		{
+			List<double[]> bars = sweepBars;
+			if (bars == null || bars.Count == 0)
+				return string.Empty;
+			int side = sweepOpen >= level ? 1 : -1;   // 1: price is above the level, -1: below
+			int state = 0;                            // 0 none, 1 swept, 2 reclaimed, 3 broken, 4 broken and rejected
+			int beyond = 0;
+			bool broken = false;
+			bool retest = false;
+			foreach (double[] bar in bars)
+			{
+				bool through = side > 0 ? bar[1] < level - tickSize : bar[0] > level + tickSize;
+				bool touch = side > 0 ? bar[1] <= level + 1 : bar[0] >= level - 1;
+				if (through)
+					state = 1;
+				if (broken && touch)
+					retest = true;
+				if (bar[3] <= 0)
+					continue;   // the forming bar only sweeps, it does not close
+				bool closeBeyond = side > 0 ? bar[2] < level : bar[2] > level;
+				if (closeBeyond)
+				{
+					if (++beyond >= 2)
+					{
+						side = -side;
+						state = 3;
+						broken = true;
+						retest = false;
+						beyond = 0;
+					}
+				}
+				else
+				{
+					beyond = 0;
+					if (state == 1)
+						state = broken ? 4 : 2;
+					else if (state == 3 && retest)
+						state = 4;
+					retest = false;
+				}
+			}
+			switch (state)
+			{
+				case 1: return " (swept)";
+				case 2: return " (swept, reclaimed)";
+				case 3: return " (broken)";
+				case 4: return " (broken, rejected)";
+				default: return string.Empty;
+			}
+		}
+
+		// Random-walk touch odds (Bachelier / reflection principle): P(touch a level d points away within T minutes)
+		// = 2 * (1 - N(d / (sigma * sqrt(T)))), sigma = points per minute from the last 60 one-minute ranges (Parkinson).
+		// Every labelled prior level and single print within reach (5% or more, not within 2 pts of price), rounded to 5%,
+		// recomputed once per 5-min bar so it does not jump with every tick. T = Touch Minutes, or until 16:00 ET when 0.
+		// Real markets have fatter tails, so treat it as a baseline, not a forecast.
+		private long touchKey = long.MinValue;
+		private void BuildTouchOdds(TpoProfile[] snapshot, int barCount)
+		{
+			if (!ShowTouchOdds || barCount == 0) { touchOdds = new Dictionary<long, double>(); touchKey = long.MinValue; return; }
+			DateTime now = ChartSeries().GetTime(barCount - 1);
+			long key = now.AddTicks(-1).Ticks / TimeSpan.FromMinutes(5).Ticks;
+			if (key == touchKey) return;
+			Dictionary<long, double> odds = new Dictionary<long, double>();
+			double sumSq = 0;
+			int n = 0;
+			lock (sync)
+				for (int i = allMinutes.Count - 2; i >= 0 && n < 60; i--, n++)   // skip the forming minute
+				{
+					double r = allMinutes[i].High - allMinutes[i].Low;
+					sumSq += r * r;
+				}
+			if (n < 20) { touchOdds = odds; return; }
+			double sigma = Math.Sqrt(sumSq / n / (4 * Math.Log(2)));
+			if (sigma <= 0) { touchOdds = odds; return; }
+			double minutes = TouchMinutes;
+			if (minutes <= 0)
+			{
+				DateTime et = TimeZoneInfo.ConvertTime(now, Core.Globals.GeneralOptions.TimeZoneInfo, TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
+				double left = (new TimeSpan(16, 0, 0) - et.TimeOfDay).TotalMinutes;
+				minutes = left > 1 ? left : left + 24 * 60;
+			}
+			double last = ChartSeries().GetClose(barCount - 1);
+
+			// the labelled prior levels and single prints: highlighted sessions and the carried prior session
+			List<double> prices = new List<double>();
+			for (int i = 0; i < snapshot.Length && i < nextSameBuffer.Length; i++)
+			{
+				bool banded = Banded(snapshot, i);
+				if (!banded && !CarriesLevels(snapshot, i))
+					continue;
+				TpoBuilt b = snapshot[i].Built;
+				if (b == null || b.RowCount == 0)
+					continue;
+				foreach (int lv in new[] { LvPoc, LvVah, LvVal, LvHigh, LvLow })
+				{
+					double lineAt, priceAt;
+					if (PriorChosen(lv, false) && LevelValues(b, lv, out lineAt, out priceAt))
+						prices.Add(priceAt);
+				}
+				if (banded && PriorHighlightSingles)
+				{
+					int rows = b.RowCount;
+					for (int r = Math.Max(0, b.BottomRun); r < rows - b.TopRun; r++)
+					{
+						if (b.Counts[r] != 1)
+							continue;
+						int first = r;
+						while (r + 1 < rows - b.TopRun && b.Counts[r + 1] == 1)
+							r++;
+						prices.Add((RowBottomPrice(b, first) + RowTopPrice(b, r)) / 2);
+					}
+				}
+			}
+			double scale = sigma * Math.Sqrt(minutes);
+			foreach (double pr in prices.Distinct())
+			{
+				double d = Math.Abs(pr - last);
+				if (d < 2)
+					continue;
+				double pct = 100 * 2 * (1 - NormCdf(d / scale));
+				if (pct < 5)
+					continue;
+				odds[(long)Math.Round(pr / tickSize)] = Math.Min(95, Math.Round(pct / 5) * 5);
+			}
+			touchOdds = odds;
+			touchKey = key;
+		}
+
+		private string TouchTag(double price)
+		{
+			double pct;
+			if (!touchOdds.TryGetValue((long)Math.Round(price / tickSize), out pct))
+				return string.Empty;
+			return TouchMinutes > 0 ? string.Format(CultureInfo.InvariantCulture, " · {0:0}%/{1}m", pct, TouchMinutes)
+				: string.Format(CultureInfo.InvariantCulture, " · {0:0}% by close", pct);
+		}
+
+		// standard normal CDF (Abramowitz-Stegun 7.1.26 erf, error < 1.5e-7)
+		private static double NormCdf(double x)
+		{
+			double z = Math.Abs(x) / Math.Sqrt(2), t = 1 / (1 + 0.3275911 * z);
+			double erf = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.Exp(-z * z);
+			return x >= 0 ? 0.5 * (1 + erf) : 0.5 * (1 - erf);
+		}
+
+		private Brush BandBrush(int kind)
+		{
+			switch (kind)
+			{
+				case BandPoc: return PriorHighlightPocBrush;
+				case BandSingle: return PriorHighlightSingleBrush;
+				case BandIb: return InitialBalanceBrush;
+				case BandHigh: return PriorHighBrush;
+				case BandLow: return PriorLowBrush;
+				case BandVolPoc: return VolumePocBrush;
+				case BandVolVa: return VolumeVahBrush;
+				default: return PriorHighlightVaBrush;
+			}
+		}
+
+		private SharpDX.Direct2D1.SolidColorBrush BandDx(int kind)
+		{
+			switch (kind)
+			{
+				case BandPoc: return dxBandPoc;
+				case BandSingle: return dxBandSingle;
+				case BandIb: return dxBandIb;
+				case BandHigh: return dxBandHigh;
+				case BandLow: return dxBandLow;
+				case BandVolPoc: return dxBandVolPoc;
+				case BandVolVa: return dxBandVolVa;
+				default: return dxBandVa;
+			}
+		}
+
+		private int BandWidth(BandLevel l)
+		{
+			int w = Math.Max(1, PriorHighlightWidth);
+			return l.Thin ? Math.Max(1, w / 2) : w;
+		}
+
 		private static bool SameBands(List<BandLevel> a, List<BandLevel> b)
 		{
 			if (b == null || a.Count != b.Count)
@@ -4150,11 +4575,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		// Draws the wanted bands as global horizontal lines (every chart of this instrument) and removes the ones no longer
 		// wanted. Called from OnBarUpdate: drawing objects can only be created there.
-		private void SyncGlobalBands()
+		private void SyncGlobalBands(bool force = false)
 		{
 			List<BandLevel> wanted = bandWanted;
 			// On a new list, and on every new bar: a line deleted by hand or by another chart's copy of the indicator comes back
-			if (wanted == null || (object.ReferenceEquals(wanted, bandSent) && !(BarsInProgress == 0 && IsFirstTickOfBar)))
+			if (wanted == null || (!force && object.ReferenceEquals(wanted, bandSent) && !(BarsInProgress == 0 && IsFirstTickOfBar)))
 				return;
 			bandSent = wanted;
 
@@ -4163,13 +4588,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				keep.Add(l.Tag);
 				double was;
-				if (bandDrawn.TryGetValue(l.Tag, out was) && was == l.Price && DrawObjects[l.Tag] != null)
+				DrawingTool shown = DrawObjects[l.Tag] as DrawingTool;
+				if (bandDrawn.TryGetValue(l.Tag, out was) && was == l.Price && shown != null)
+				{
+					shown.IsLocked = true;
+					shown.IgnoresUserInput = true;
 					continue;
+				}
 				HorizontalLine line = Draw.HorizontalLine(this, l.Tag, l.Price, true, null);
 				if (line == null)
 					continue;
-				line.Stroke = new Stroke(l.Kind == BandPoc ? PriorHighlightPocBrush : l.Kind == BandSingle ? PriorHighlightSingleBrush : PriorHighlightVaBrush, DashStyleHelper.Solid,
-					Math.Max(1, PriorHighlightWidth), Math.Max(0, Math.Min(100, PriorHighlightOpacity)));
+				// Can't be clicked, moved or deleted by hand: they belong to the indicator
+				line.IsLocked = true;
+				line.IgnoresUserInput = true;
+				line.Stroke = new Stroke(BandBrush(l.Kind), DashStyleHelper.Solid, BandWidth(l), Math.Max(0, Math.Min(100, PriorHighlightOpacity)));
 				line.IsPriceMarkerVisible = false;
 				bandDrawn[l.Tag] = l.Price;
 			}
@@ -4484,7 +4916,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				// An untouched prior POC is labelled once, as "nPOC" at the right edge, by the naked pass.
 				if (carried && !(lv == LvPoc && NakedPocOpen(p, b)))
-					DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
+					DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price) + TouchTag(price), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
 
 				if (isLatest && shown && LevelScale(lv, ethLevels))
 					DrawScaleTag(lv, price, y);
@@ -5191,6 +5623,25 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Display(Name = "Highlight On All Charts", Description = "Draw the bands as global horizontal lines, shown on every chart of this instrument (like a drawing attached to All charts). The labels stay on this chart. Off: drawn on this chart only.", GroupName = "3. Profile - Core Levels", Order = 32)]
 		public bool PriorHighlightGlobal { get; set; }
+
+		[Display(Name = "Highlight Today's Levels", Description = "Also band the newest session's chosen POC / VAH / VAL as they develop: same colours, half the width. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 35)]
+		public bool HighlightToday { get; set; }
+
+		[Display(Name = "Highlight Initial Balance", Description = "Also band the initial balance high and low (Initial Balance colour), half the width. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 36)]
+		public bool HighlightIb { get; set; }
+
+		[Display(Name = "Highlight Session High / Low", Description = "Also band the newest session's high and low (half the width) and the high and low of every highlighted session, in the Prior High / Prior Low colours. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 37)]
+		public bool HighlightRange { get; set; }
+
+		[Display(Name = "Highlight Volume Levels", Description = "Also band the volume profile's POC / VAH / VAL of the highlighted sessions (Volume POC / VAH colours), half the width. Needs the volume profile and Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 38)]
+		public bool HighlightVolume { get; set; }
+
+		[Display(Name = "Touch Odds", Description = "Add to the labels of every prior level and single print within reach the chance a random walk at the last hour's volatility touches it within Touch Minutes (rounded to 5%, updated each 5-min bar; a baseline: real markets have fatter tails).", GroupName = "3. Profile - Core Levels", Order = 39)]
+		public bool ShowTouchOdds { get; set; }
+
+		[Range(0, 600)]
+		[Display(Name = "Touch Minutes", Description = "Time window for Touch Odds. 0 = until the 16:00 ET close (swing targets).", GroupName = "3. Profile - Core Levels", Order = 40)]
+		public int TouchMinutes { get; set; }
 
 		#endregion
 
