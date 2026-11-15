@@ -99,6 +99,33 @@ namespace TpoMarketProfileTypes
 		Right,
 		OverTpo
 	}
+
+	// The newest RTH profile's levels, for other NinjaScript on the same instrument (written while the chart renders).
+	// Names: VAH / POC / VAL / High / Low of the current (newest) profile, pVAH / pPOC / pVAL / pHigh / pLow of the one
+	// before it, SP for the middle of each single print run of the one before, IBH / IBL once the initial balance is done.
+	public sealed class TpoLevelSet
+	{
+		public DateTime At;              // local clock when written
+		public DateTime CurrentDate;     // session date of the newest RTH profile
+		public KeyValuePair<string, double>[] Levels;
+	}
+
+	public static class TpoLevelFeed
+	{
+		private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TpoLevelSet> sets =
+			new System.Collections.Concurrent.ConcurrentDictionary<string, TpoLevelSet>();
+
+		public static void Publish(string instrument, TpoLevelSet set) { sets[instrument] = set; }
+
+		// null when no TPO chart of this instrument has drawn in maxAgeSec
+		public static TpoLevelSet Get(string instrument, int maxAgeSec)
+		{
+			TpoLevelSet s;
+			if (instrument == null || !sets.TryGetValue(instrument, out s) || (DateTime.Now - s.At).TotalSeconds > maxAgeSec)
+				return null;
+			return s;
+		}
+	}
 }
 
 namespace NinjaTrader.NinjaScript.Indicators
@@ -466,6 +493,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush dxGapArea;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandVa;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandPoc;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandIb;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandHigh;
+		private SharpDX.Direct2D1.SolidColorBrush dxBandLow;
 		private SharpDX.Direct2D1.SolidColorBrush dxBandSingle;
 		private bool drawingBanded;
 		private static readonly int[] BandLevels = { LvPoc, LvVah, LvVal };
@@ -476,11 +506,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			public string Tag;
 			public double Price;
-			public int Kind;   // BandPoc, BandVa or BandSingle
+			public int Kind;   // BandPoc, BandVa, BandSingle, BandIb, BandHigh or BandLow
+			public bool Thin;  // today's developing levels: half the width
 		}
 		private const int BandPoc = 0;
 		private const int BandVa = 1;
 		private const int BandSingle = 2;
+		private const int BandIb = 3;
+		private const int BandHigh = 4;
+		private const int BandLow = 5;
 		private volatile List<BandLevel> bandWanted;
 		private volatile HashSet<string> bandShown = new HashSet<string>();   // drawn as global lines (copy-on-write, read while rendering)
 		private List<BandLevel> bandSent;
@@ -600,6 +634,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				PriorHighlightPocBrush = Brushes.Yellow;
 				PriorHighlightGlobal = true;
 				PriorHighlightSingles = true;
+				HighlightToday = true;
+				HighlightIb = true;
+				HighlightRange = true;
 				PriorHighlightSingleBrush = Brushes.Magenta;
 
 				// 3b. ETH profile levels (with Add ETH Profiles)
@@ -3143,6 +3180,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 			dxBandVa = MakeBrush(PriorHighlightVaBrush, bandOpacity);
 			dxBandPoc = MakeBrush(PriorHighlightPocBrush, bandOpacity);
 			dxBandSingle = MakeBrush(PriorHighlightSingleBrush, bandOpacity);
+			dxBandIb = MakeBrush(InitialBalanceBrush, bandOpacity);
+			dxBandHigh = MakeBrush(PriorHighBrush, bandOpacity);
+			dxBandLow = MakeBrush(PriorLowBrush, bandOpacity);
 			dxDayType = MakeBrush(DayTypeBrush, 1f);
 			dxOpenType = MakeBrush(OpenTypeBrush, 1f);
 			dxStatsBack = MakeBrush(StatisticsBackgroundBrush, 0.75f);
@@ -3232,6 +3272,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 			DisposeBrush(ref dxGapArea);
 			DisposeBrush(ref dxBandVa);
 			DisposeBrush(ref dxBandPoc);
+			DisposeBrush(ref dxBandIb);
+			DisposeBrush(ref dxBandHigh);
+			DisposeBrush(ref dxBandLow);
 			DisposeBrush(ref dxBandSingle);
 			DisposeBrush(ref dxDayType);
 			DisposeBrush(ref dxOpenType);
@@ -3836,6 +3879,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 			drawingBanded = false;
 
+			// The newest RTH profile (today, or the last session while the market is closed) and the one before it
+			int curIdx = -1, prevIdx = -1;
+			for (int i = 0; i < snapshot.Length; i++)
+				if (!EthSet(snapshot[i]) && nextSameBuffer[i] < 0)
+					curIdx = i;
+			for (int i = 0; i < snapshot.Length && curIdx >= 0; i++)
+				if (nextSameBuffer[i] == curIdx && !EthSet(snapshot[i]))
+					prevIdx = i;
+			PublishLevels(snapshot, curIdx, prevIdx, ibReady, ibTop, ibBottom);
+
 			// "Highlight Prior Levels": the chosen POC / VAH / VAL of the last few sessions before the current one,
 			// as wide see-through bands from their own profile to the right edge.
 			if (PriorHighlight)
@@ -3907,6 +3960,51 @@ namespace NinjaTrader.NinjaScript.Indicators
 						}
 					}
 				}
+				// Today's levels as thinner bands in the same colours, the initial balance, and today's and the prior session's range
+				List<BandLevel> extra = new List<BandLevel>();
+				TpoProfile cur = curIdx >= 0 ? snapshot[curIdx] : null;
+				TpoProfile prev = prevIdx >= 0 ? snapshot[prevIdx] : null;
+				string curKey = cur != null && cur.Sessions.Count > 0 ? "TPOband_" + cur.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) : null;
+				string prevKey = prev != null && prev.Sessions.Count > 0 ? "TPOband_" + prev.Sessions[0].OrderKey.Ticks.ToString(CultureInfo.InvariantCulture) : null;
+				double lineAt, priceAt;
+				if (curKey != null && cur.Built != null && cur.Built.RowCount > 0)
+				{
+					if (HighlightToday)
+						foreach (int lv in BandLevels)
+							if (PriorChosen(lv, false) && LevelValues(cur.Built, lv, out lineAt, out priceAt))
+								extra.Add(new BandLevel { Tag = curKey + "_today" + LevelName(lv), Price = lineAt, Kind = lv == LvPoc ? BandPoc : BandVa, Thin = true });
+					if (HighlightRange)
+					{
+						extra.Add(new BandLevel { Tag = curKey + "_todayHigh", Price = cur.Built.High, Kind = BandHigh, Thin = true });
+						extra.Add(new BandLevel { Tag = curKey + "_todayLow", Price = cur.Built.Low, Kind = BandLow, Thin = true });
+					}
+					if (HighlightIb && ibReady)
+					{
+						extra.Add(new BandLevel { Tag = curKey + "_IBH", Price = ibTop, Kind = BandIb, Thin = true });
+						extra.Add(new BandLevel { Tag = curKey + "_IBL", Price = ibBottom, Kind = BandIb, Thin = true });
+					}
+				}
+				if (HighlightRange && prevKey != null && prev.Built != null && prev.Built.RowCount > 0)
+				{
+					extra.Add(new BandLevel { Tag = prevKey + "_High", Price = prev.Built.High, Kind = BandHigh });
+					extra.Add(new BandLevel { Tag = prevKey + "_Low", Price = prev.Built.Low, Kind = BandLow });
+				}
+				float xToday = cur != null ? Math.Max(clipLeft, XOfIndex(chartControl, cur.GeoStart, lastIdx, barDistance) - barDistance * 0.5f) : clipLeft;
+				float xPrev = prev != null ? Math.Max(clipLeft, XOfIndex(chartControl, prev.GeoStart, lastIdx, barDistance) - barDistance * 0.5f) : clipLeft;
+				foreach (BandLevel l in extra)
+				{
+					if (wanted != null)
+					{
+						l.Tag = GlobalDrawingToolManager.GlobalDrawingToolTagPrefix + l.Tag;
+						wanted.Add(l);
+						if (bandShown.Contains(l.Tag))
+							continue;
+					}
+					float x0 = l.Thin ? xToday : xPrev;
+					if (x0 < clipRight)
+						HLine(x0, clipRight, chartScale.GetYByValue(l.Price), BandDx(l.Kind), BandWidth(l), null);
+				}
+
 				if (wanted != null && !SameBands(wanted, bandWanted))
 					bandWanted = wanted;
 			}
@@ -4138,6 +4236,85 @@ namespace NinjaTrader.NinjaScript.Indicators
 			return PriorSessionLevels || nextSameBuffer[next] < 0;
 		}
 
+		// Shares the newest RTH profile's levels with other NinjaScript on this instrument (TradePlanPanel): TpoLevelFeed
+		private void PublishLevels(TpoProfile[] snapshot, int curIdx, int prevIdx, bool ibReady, double ibTop, double ibBottom)
+		{
+			if (curIdx < 0 || Instrument == null)
+				return;
+			TpoProfile cur = snapshot[curIdx];
+			if (cur.Built == null || cur.Built.RowCount == 0 || cur.Sessions.Count == 0)
+				return;
+			List<KeyValuePair<string, double>> levels = new List<KeyValuePair<string, double>>();
+			Action<string, TpoBuilt> add = (prefix, b) =>
+			{
+				double lineAt, priceAt;
+				foreach (int lv in new[] { LvVah, LvPoc, LvVal })
+					if (LevelValues(b, lv, out lineAt, out priceAt))
+						levels.Add(new KeyValuePair<string, double>(prefix + LevelName(lv), priceAt));
+				levels.Add(new KeyValuePair<string, double>(prefix + "High", b.High));
+				levels.Add(new KeyValuePair<string, double>(prefix + "Low", b.Low));
+			};
+			add("", cur.Built);
+			TpoBuilt pb = prevIdx >= 0 ? snapshot[prevIdx].Built : null;
+			if (pb != null && pb.RowCount > 0)
+			{
+				add("p", pb);
+				int n = pb.RowCount;
+				for (int r = Math.Max(0, pb.BottomRun); r < n - pb.TopRun; r++)
+				{
+					if (pb.Counts[r] != 1)
+						continue;
+					int first = r;
+					while (r + 1 < n - pb.TopRun && pb.Counts[r + 1] == 1)
+						r++;
+					levels.Add(new KeyValuePair<string, double>("SP", (RowBottomPrice(pb, first) + RowTopPrice(pb, r)) / 2));
+				}
+			}
+			if (ibReady)
+			{
+				levels.Add(new KeyValuePair<string, double>("IBH", ibTop));
+				levels.Add(new KeyValuePair<string, double>("IBL", ibBottom));
+			}
+			TpoMarketProfileTypes.TpoLevelFeed.Publish(Instrument.FullName, new TpoMarketProfileTypes.TpoLevelSet
+			{
+				At = DateTime.Now,
+				CurrentDate = cur.Sessions[cur.Sessions.Count - 1].PeriodDate,
+				Levels = levels.ToArray()
+			});
+		}
+
+		private Brush BandBrush(int kind)
+		{
+			switch (kind)
+			{
+				case BandPoc: return PriorHighlightPocBrush;
+				case BandSingle: return PriorHighlightSingleBrush;
+				case BandIb: return InitialBalanceBrush;
+				case BandHigh: return PriorHighBrush;
+				case BandLow: return PriorLowBrush;
+				default: return PriorHighlightVaBrush;
+			}
+		}
+
+		private SharpDX.Direct2D1.SolidColorBrush BandDx(int kind)
+		{
+			switch (kind)
+			{
+				case BandPoc: return dxBandPoc;
+				case BandSingle: return dxBandSingle;
+				case BandIb: return dxBandIb;
+				case BandHigh: return dxBandHigh;
+				case BandLow: return dxBandLow;
+				default: return dxBandVa;
+			}
+		}
+
+		private int BandWidth(BandLevel l)
+		{
+			int w = Math.Max(1, PriorHighlightWidth);
+			return l.Thin ? Math.Max(1, w / 2) : w;
+		}
+
 		private static bool SameBands(List<BandLevel> a, List<BandLevel> b)
 		{
 			if (b == null || a.Count != b.Count)
@@ -4168,8 +4345,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				HorizontalLine line = Draw.HorizontalLine(this, l.Tag, l.Price, true, null);
 				if (line == null)
 					continue;
-				line.Stroke = new Stroke(l.Kind == BandPoc ? PriorHighlightPocBrush : l.Kind == BandSingle ? PriorHighlightSingleBrush : PriorHighlightVaBrush, DashStyleHelper.Solid,
-					Math.Max(1, PriorHighlightWidth), Math.Max(0, Math.Min(100, PriorHighlightOpacity)));
+				line.Stroke = new Stroke(BandBrush(l.Kind), DashStyleHelper.Solid, BandWidth(l), Math.Max(0, Math.Min(100, PriorHighlightOpacity)));
 				line.IsPriceMarkerVisible = false;
 				bandDrawn[l.Tag] = l.Price;
 			}
@@ -5191,6 +5367,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Display(Name = "Highlight On All Charts", Description = "Draw the bands as global horizontal lines, shown on every chart of this instrument (like a drawing attached to All charts). The labels stay on this chart. Off: drawn on this chart only.", GroupName = "3. Profile - Core Levels", Order = 32)]
 		public bool PriorHighlightGlobal { get; set; }
+
+		[Display(Name = "Highlight Today's Levels", Description = "Also band the newest session's chosen POC / VAH / VAL as they develop: same colours, half the width. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 35)]
+		public bool HighlightToday { get; set; }
+
+		[Display(Name = "Highlight Initial Balance", Description = "Also band the initial balance high and low (Initial Balance colour), half the width. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 36)]
+		public bool HighlightIb { get; set; }
+
+		[Display(Name = "Highlight Session High / Low", Description = "Also band the newest session's high and low (half the width) and the prior session's high and low, in the Prior High / Prior Low colours. Needs Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 37)]
+		public bool HighlightRange { get; set; }
 
 		#endregion
 
