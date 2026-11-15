@@ -523,6 +523,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		// 5-min bars {high, low, close, closed} of the newest RTH session from its open (render thread), for SweepTag
 		private List<double[]> sweepBars;
 		private DateTime bandCheckAt = DateTime.MinValue;
+		// touch odds (render thread): level (in ticks) -> % chance a random walk at the last hour's volatility touches it
+		// within TouchMinutes; only the nearest 2 labelled levels above and below price get one
+		private Dictionary<long, double> touchOdds = new Dictionary<long, double>();
 		private double sweepOpen;
 		private volatile List<BandLevel> bandWanted;
 		private volatile HashSet<string> bandShown = new HashSet<string>();   // drawn as global lines (copy-on-write, read while rendering)
@@ -647,6 +650,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				HighlightIb = true;
 				HighlightRange = true;
 				HighlightVolume = true;
+				ShowTouchOdds = true;
+				TouchMinutes = 30;
 				PriorHighlightSingleBrush = Brushes.Magenta;
 
 				// 3b. ETH profile levels (with Add ETH Profiles)
@@ -3857,6 +3862,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				CreateDeviceResources();
 
 			BuildSweepBars(snapshot, barCount);
+			BuildTouchOdds(snapshot, barCount);
 
 			for (int i = 0; i < snapshot.Length; i++)
 			{
@@ -3949,7 +3955,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 							HLine(xStart, clipRight, y, lv == LvPoc ? dxBandPoc : dxBandVa, Math.Max(1, PriorHighlightWidth), null);
 						// An untouched naked level is labelled at the right edge by the naked pass
 						if (!NakedOpen(p, b, lv))
-							DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
+							DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price) + TouchTag(price), clipRight - 4f, y, dxLevel[lv], true, -1, labelFormat);
 					}
 
 					// Single prints: one band through the middle of each run of single-print rows inside the profile
@@ -4422,6 +4428,69 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
+		// Random-walk touch odds (Bachelier / reflection principle): P(touch a level d points away within T minutes)
+		// = 2 * (1 - N(d / (sigma * sqrt(T)))), sigma = points per minute from the last 60 one-minute ranges (Parkinson).
+		// Real markets have fatter tails, so treat it as a baseline, not a forecast.
+		private void BuildTouchOdds(TpoProfile[] snapshot, int barCount)
+		{
+			Dictionary<long, double> odds = new Dictionary<long, double>();
+			touchOdds = odds;
+			if (!ShowTouchOdds || barCount == 0 || TouchMinutes <= 0)
+				return;
+			double sumSq = 0;
+			int n = 0;
+			lock (sync)
+				for (int i = allMinutes.Count - 2; i >= 0 && n < 60; i--, n++)   // skip the forming minute
+				{
+					double r = allMinutes[i].High - allMinutes[i].Low;
+					sumSq += r * r;
+				}
+			if (n < 20)
+				return;
+			double sigma = Math.Sqrt(sumSq / n / (4 * Math.Log(2)));
+			if (sigma <= 0)
+				return;
+			double last = ChartSeries().GetClose(barCount - 1);
+
+			// the labelled prior levels: highlighted sessions and the carried prior session
+			List<double> prices = new List<double>();
+			for (int i = 0; i < snapshot.Length && i < nextSameBuffer.Length; i++)
+			{
+				if (!Banded(snapshot, i) && !CarriesLevels(snapshot, i))
+					continue;
+				TpoBuilt b = snapshot[i].Built;
+				if (b == null || b.RowCount == 0)
+					continue;
+				foreach (int lv in new[] { LvPoc, LvVah, LvVal, LvHigh, LvLow })
+				{
+					double lineAt, priceAt;
+					if (PriorChosen(lv, false) && LevelValues(b, lv, out lineAt, out priceAt))
+						prices.Add(priceAt);
+				}
+			}
+			double scale = sigma * Math.Sqrt(TouchMinutes);
+			foreach (double pr in prices.Where(x => x > last).OrderBy(x => x).Distinct().Take(2)
+				.Concat(prices.Where(x => x < last).OrderByDescending(x => x).Distinct().Take(2)))
+				odds[(long)Math.Round(pr / tickSize)] = 100 * 2 * (1 - NormCdf(Math.Abs(pr - last) / scale));
+			touchOdds = odds;
+		}
+
+		private string TouchTag(double price)
+		{
+			double pct;
+			if (!touchOdds.TryGetValue((long)Math.Round(price / tickSize), out pct))
+				return string.Empty;
+			return string.Format(CultureInfo.InvariantCulture, " · {0:0}%/{1}m", Math.Min(99, pct), TouchMinutes);
+		}
+
+		// standard normal CDF (Abramowitz-Stegun 7.1.26 erf, error < 1.5e-7)
+		private static double NormCdf(double x)
+		{
+			double z = Math.Abs(x) / Math.Sqrt(2), t = 1 / (1 + 0.3275911 * z);
+			double erf = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.Exp(-z * z);
+			return x >= 0 ? 0.5 * (1 + erf) : 0.5 * (1 - erf);
+		}
+
 		private Brush BandBrush(int kind)
 		{
 			switch (kind)
@@ -4811,7 +4880,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				// An untouched prior POC is labelled once, as "nPOC" at the right edge, by the naked pass.
 				if (carried && !(lv == LvPoc && NakedPocOpen(p, b)))
-					DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
+					DrawLabel(PriorText(LevelName(lv), price, ProfileIsEth(p)) + SweepTag(price) + TouchTag(price), Math.Min(xPriorEnd, clipRight) - 4f, y, dxLevel[lv], true, lv == LvLow ? 1 : -1, labelFormat);
 
 				if (isLatest && shown && LevelScale(lv, ethLevels))
 					DrawScaleTag(lv, price, y);
@@ -5530,6 +5599,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Display(Name = "Highlight Volume Levels", Description = "Also band the volume profile's POC / VAH / VAL of the highlighted sessions (Volume POC / VAH colours), half the width. Needs the volume profile and Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 38)]
 		public bool HighlightVolume { get; set; }
+
+		[Display(Name = "Touch Odds", Description = "Add to the labels of the nearest 2 prior levels above and below price the chance a random walk at the last hour's volatility touches them within Touch Minutes (a baseline: real markets have fatter tails).", GroupName = "3. Profile - Core Levels", Order = 39)]
+		public bool ShowTouchOdds { get; set; }
+
+		[Range(1, 600)]
+		[Display(Name = "Touch Minutes", Description = "Time window for Touch Odds.", GroupName = "3. Profile - Core Levels", Order = 40)]
+		public int TouchMinutes { get; set; }
 
 		#endregion
 
