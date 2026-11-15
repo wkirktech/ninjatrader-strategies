@@ -650,7 +650,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				HighlightIb = true;
 				HighlightRange = true;
 				HighlightVolume = true;
-				ShowTouchOdds = true;
+				ShowTouchOdds = false;
 				TouchMinutes = 30;
 				PriorHighlightSingleBrush = Brushes.Magenta;
 
