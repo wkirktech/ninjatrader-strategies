@@ -3979,6 +3979,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 							}
 							if (xStart < clipRight && (tag == null || !bandShown.Contains(tag)))
 								HLine(xStart, clipRight, chartScale.GetYByValue(mid), dxBandSingle, Math.Max(1, PriorHighlightWidth), null);
+							// a single print within reach gets a label with its touch odds
+							string odds = TouchTag(mid);
+							if (odds.Length > 0 && xStart < clipRight)
+								DrawLabel(PriorText("SP", mid, ProfileIsEth(p)) + SweepTag(mid) + odds, clipRight - 4f, chartScale.GetYByValue(mid), dxText, true, -1, labelFormat);
 						}
 					}
 
@@ -4430,13 +4434,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		// Random-walk touch odds (Bachelier / reflection principle): P(touch a level d points away within T minutes)
 		// = 2 * (1 - N(d / (sigma * sqrt(T)))), sigma = points per minute from the last 60 one-minute ranges (Parkinson).
+		// Every labelled prior level and single print within reach (5% or more, not within 2 pts of price), rounded to 5%,
+		// recomputed once per 5-min bar so it does not jump with every tick. T = Touch Minutes, or until 16:00 ET when 0.
 		// Real markets have fatter tails, so treat it as a baseline, not a forecast.
+		private long touchKey = long.MinValue;
 		private void BuildTouchOdds(TpoProfile[] snapshot, int barCount)
 		{
+			if (!ShowTouchOdds || barCount == 0) { touchOdds = new Dictionary<long, double>(); touchKey = long.MinValue; return; }
+			DateTime now = ChartSeries().GetTime(barCount - 1);
+			long key = now.AddTicks(-1).Ticks / TimeSpan.FromMinutes(5).Ticks;
+			if (key == touchKey) return;
 			Dictionary<long, double> odds = new Dictionary<long, double>();
-			touchOdds = odds;
-			if (!ShowTouchOdds || barCount == 0 || TouchMinutes <= 0)
-				return;
 			double sumSq = 0;
 			int n = 0;
 			lock (sync)
@@ -4445,18 +4453,24 @@ namespace NinjaTrader.NinjaScript.Indicators
 					double r = allMinutes[i].High - allMinutes[i].Low;
 					sumSq += r * r;
 				}
-			if (n < 20)
-				return;
+			if (n < 20) { touchOdds = odds; return; }
 			double sigma = Math.Sqrt(sumSq / n / (4 * Math.Log(2)));
-			if (sigma <= 0)
-				return;
+			if (sigma <= 0) { touchOdds = odds; return; }
+			double minutes = TouchMinutes;
+			if (minutes <= 0)
+			{
+				DateTime et = TimeZoneInfo.ConvertTime(now, Core.Globals.GeneralOptions.TimeZoneInfo, TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
+				double left = (new TimeSpan(16, 0, 0) - et.TimeOfDay).TotalMinutes;
+				minutes = left > 1 ? left : left + 24 * 60;
+			}
 			double last = ChartSeries().GetClose(barCount - 1);
 
-			// the labelled prior levels: highlighted sessions and the carried prior session
+			// the labelled prior levels and single prints: highlighted sessions and the carried prior session
 			List<double> prices = new List<double>();
 			for (int i = 0; i < snapshot.Length && i < nextSameBuffer.Length; i++)
 			{
-				if (!Banded(snapshot, i) && !CarriesLevels(snapshot, i))
+				bool banded = Banded(snapshot, i);
+				if (!banded && !CarriesLevels(snapshot, i))
 					continue;
 				TpoBuilt b = snapshot[i].Built;
 				if (b == null || b.RowCount == 0)
@@ -4467,12 +4481,33 @@ namespace NinjaTrader.NinjaScript.Indicators
 					if (PriorChosen(lv, false) && LevelValues(b, lv, out lineAt, out priceAt))
 						prices.Add(priceAt);
 				}
+				if (banded && PriorHighlightSingles)
+				{
+					int rows = b.RowCount;
+					for (int r = Math.Max(0, b.BottomRun); r < rows - b.TopRun; r++)
+					{
+						if (b.Counts[r] != 1)
+							continue;
+						int first = r;
+						while (r + 1 < rows - b.TopRun && b.Counts[r + 1] == 1)
+							r++;
+						prices.Add((RowBottomPrice(b, first) + RowTopPrice(b, r)) / 2);
+					}
+				}
 			}
-			double scale = sigma * Math.Sqrt(TouchMinutes);
-			foreach (double pr in prices.Where(x => x > last).OrderBy(x => x).Distinct().Take(2)
-				.Concat(prices.Where(x => x < last).OrderByDescending(x => x).Distinct().Take(2)))
-				odds[(long)Math.Round(pr / tickSize)] = 100 * 2 * (1 - NormCdf(Math.Abs(pr - last) / scale));
+			double scale = sigma * Math.Sqrt(minutes);
+			foreach (double pr in prices.Distinct())
+			{
+				double d = Math.Abs(pr - last);
+				if (d < 2)
+					continue;
+				double pct = 100 * 2 * (1 - NormCdf(d / scale));
+				if (pct < 5)
+					continue;
+				odds[(long)Math.Round(pr / tickSize)] = Math.Min(95, Math.Round(pct / 5) * 5);
+			}
 			touchOdds = odds;
+			touchKey = key;
 		}
 
 		private string TouchTag(double price)
@@ -4480,7 +4515,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			double pct;
 			if (!touchOdds.TryGetValue((long)Math.Round(price / tickSize), out pct))
 				return string.Empty;
-			return string.Format(CultureInfo.InvariantCulture, " · {0:0}%/{1}m", Math.Min(99, pct), TouchMinutes);
+			return TouchMinutes > 0 ? string.Format(CultureInfo.InvariantCulture, " · {0:0}%/{1}m", pct, TouchMinutes)
+				: string.Format(CultureInfo.InvariantCulture, " · {0:0}% by close", pct);
 		}
 
 		// standard normal CDF (Abramowitz-Stegun 7.1.26 erf, error < 1.5e-7)
@@ -5600,11 +5636,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Display(Name = "Highlight Volume Levels", Description = "Also band the volume profile's POC / VAH / VAL of the highlighted sessions (Volume POC / VAH colours), half the width. Needs the volume profile and Highlight Prior Levels on.", GroupName = "3. Profile - Core Levels", Order = 38)]
 		public bool HighlightVolume { get; set; }
 
-		[Display(Name = "Touch Odds", Description = "Add to the labels of the nearest 2 prior levels above and below price the chance a random walk at the last hour's volatility touches them within Touch Minutes (a baseline: real markets have fatter tails).", GroupName = "3. Profile - Core Levels", Order = 39)]
+		[Display(Name = "Touch Odds", Description = "Add to the labels of every prior level and single print within reach the chance a random walk at the last hour's volatility touches it within Touch Minutes (rounded to 5%, updated each 5-min bar; a baseline: real markets have fatter tails).", GroupName = "3. Profile - Core Levels", Order = 39)]
 		public bool ShowTouchOdds { get; set; }
 
-		[Range(1, 600)]
-		[Display(Name = "Touch Minutes", Description = "Time window for Touch Odds.", GroupName = "3. Profile - Core Levels", Order = 40)]
+		[Range(0, 600)]
+		[Display(Name = "Touch Minutes", Description = "Time window for Touch Odds. 0 = until the 16:00 ET close (swing targets).", GroupName = "3. Profile - Core Levels", Order = 40)]
 		public int TouchMinutes { get; set; }
 
 		#endregion
