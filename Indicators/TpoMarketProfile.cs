@@ -522,6 +522,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		// 5-min bars {high, low, close, closed} of the newest RTH session from its open (render thread), for SweepTag
 		private List<double[]> sweepBars;
+		private DateTime bandCheckAt = DateTime.MinValue;
 		private double sweepOpen;
 		private volatile List<BandLevel> bandWanted;
 		private volatile HashSet<string> bandShown = new HashSet<string>();   // drawn as global lines (copy-on-write, read while rendering)
@@ -4039,13 +4040,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 						HLine(xToday, clipRight, chartScale.GetYByValue(l.Price), BandDx(l.Kind), BandWidth(l), null);
 				}
 
-				if (wanted != null && !SameBands(wanted, bandWanted))
-				{
+				// Draw the global lines now, not on the next bar (none come while the market or Playback is paused), and every
+				// few seconds put back any that were removed (Remove All Drawing Objects, another chart's copy of the indicator)
+				bool changed = wanted != null && !SameBands(wanted, bandWanted);
+				if (changed)
 					bandWanted = wanted;
-					// Draw the global lines now, not on the next bar: none come while the market or Playback is paused
+				if (wanted != null && (changed || (DateTime.Now - bandCheckAt).TotalSeconds >= 3))
+				{
+					bandCheckAt = DateTime.Now;
 					ChartControl cc = ChartControl;
 					if (cc != null)
-						cc.Dispatcher.InvokeAsync(() => { try { TriggerCustomEvent(o => SyncGlobalBands(), null); } catch { } });
+						cc.Dispatcher.InvokeAsync(() => { try { TriggerCustomEvent(o => SyncGlobalBands(true), null); } catch { } });
 				}
 			}
 
@@ -4465,11 +4470,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		// Draws the wanted bands as global horizontal lines (every chart of this instrument) and removes the ones no longer
 		// wanted. Called from OnBarUpdate: drawing objects can only be created there.
-		private void SyncGlobalBands()
+		private void SyncGlobalBands(bool force = false)
 		{
 			List<BandLevel> wanted = bandWanted;
 			// On a new list, and on every new bar: a line deleted by hand or by another chart's copy of the indicator comes back
-			if (wanted == null || (object.ReferenceEquals(wanted, bandSent) && !(BarsInProgress == 0 && IsFirstTickOfBar)))
+			if (wanted == null || (!force && object.ReferenceEquals(wanted, bandSent) && !(BarsInProgress == 0 && IsFirstTickOfBar)))
 				return;
 			bandSent = wanted;
 
@@ -4478,11 +4483,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				keep.Add(l.Tag);
 				double was;
-				if (bandDrawn.TryGetValue(l.Tag, out was) && was == l.Price && DrawObjects[l.Tag] != null)
+				DrawingTool shown = DrawObjects[l.Tag] as DrawingTool;
+				if (bandDrawn.TryGetValue(l.Tag, out was) && was == l.Price && shown != null)
+				{
+					shown.IsLocked = true;
+					shown.IgnoresUserInput = true;
 					continue;
+				}
 				HorizontalLine line = Draw.HorizontalLine(this, l.Tag, l.Price, true, null);
 				if (line == null)
 					continue;
+				// Can't be clicked, moved or deleted by hand: they belong to the indicator
+				line.IsLocked = true;
+				line.IgnoresUserInput = true;
 				line.Stroke = new Stroke(BandBrush(l.Kind), DashStyleHelper.Solid, BandWidth(l), Math.Max(0, Math.Min(100, PriorHighlightOpacity)));
 				line.IsPriceMarkerVisible = false;
 				bandDrawn[l.Tag] = l.Price;
